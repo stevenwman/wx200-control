@@ -1,0 +1,8 @@
+# python=3.12
+mink
+mujoco
+numpy
+scipy
+pyspacemouse
+dynamixel-sdk
+matplotlib
