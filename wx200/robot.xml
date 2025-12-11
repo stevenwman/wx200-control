@@ -1,0 +1,95 @@
+<?xml version="1.0"?>
+<!-- Generated using onshape-to-robot -->
+<!-- Onshape https://cad.onshape.com/documents/e3921f789fe40c0afb5d0772/w/3040b45b657884b455f5a594/e/282814625c4d8aabf1240bd0 -->
+<mujoco model="wx200">
+    <compiler angle="radian" meshdir="assets"/>
+    <default>
+        <default class="wx200">
+            <joint frictionloss="0.1" armature="0.005" />
+            <position kp="50" dampratio="1" forcerange="-35 35"/>
+        </default>
+    </default>
+
+    <worldbody>
+        <body name="base" pos="0 0 0" quat="1 0 0 0" childclass="wx200">
+            <inertial pos="2.70131e-07 -0.00824666 0.0264502" mass="0.976" fullinertia="0.00354168 0.00116937 0.00397238 -3.59126e-08 1.26053e-09 0.000264141" />
+            <geom type="mesh" pos="0 -0.040232 1.1921e-10" quat="1 0 0 0" mesh="base" material="base_material" />
+            
+            <body name="link1" pos="-3.55271e-17 -0.040232 0.069" quat="8.77076e-15 1 -0 -0">
+                <joint axis="0 0 1" name="base-1_z" type="hinge" range="-3.14159 3.14159"/>
+                <inertial pos="-3.97606e-17 -6.21407e-17 -0.0224742" mass="0.124" fullinertia="5.65496e-05 0.00015649 0.00014827 -4.09519e-12 0 0" />
+                <geom type="mesh" pos="-5.23051e-11 -5.37617e-08 0" quat="0 1 0 0" mesh="link1" material="link1_material" />
+                
+                <body name="link2" pos="-5.23051e-11 4.85723e-17 -0.04125" quat="0.5 0.5 -0.5 -0.5">
+                    <joint axis="0 0 1" name="link1-2_x" type="hinge" range="-1.8849555921538759 1.9722220547535925" />
+                    <inertial pos="-0.00965008 -0.135057 1.94879e-05" mass="0.211" fullinertia="0.00115115 9.01094e-05 0.00119979 -0.000130485 -2.45666e-08 -5.93831e-08" />
+                    <geom type="mesh" pos="-2.77556e-17 -6.38378e-16 0" quat="0.5 0.5 0.5 -0.5" mesh="link2" material="link2_material" />
+                    
+                    <body name="link3" pos="-0.05 -0.2 0" quat="1 -0 2.22045e-16 -5.55112e-17">
+                        <joint axis="0 0 1" name="link2-3_x" type="hinge" range="-1.8849555921538759 1.6231562043547265" />
+                        <inertial pos="-0.117776 -3.90352e-09 3.57685e-09" mass="0.185" fullinertia="3.78328e-05 0.000727081 0.000715749 3.65952e-11 -4.11274e-11 2.39756e-11" />
+                        <geom type="mesh" pos="-2.77556e-17 -1.90511e-09 0" quat="0.5 0.5 0.5 -0.5" mesh="link3" material="link3_material" />
+                        
+                        <body name="link4" pos="-0.2 -1.90511e-09 -6.46235e-27" quat="1 -0 -8.32667e-17 -2.08167e-17">
+                            <joint axis="0 0 1" name="link3-4_x" type="hinge" range="-1.7453292519943304 2.1467549799530246" />
+                            <inertial pos="-0.0444112 -0.0112853 2.08649e-10" mass="0.061" fullinertia="1.84408e-05 1.79804e-05 1.97397e-05 -7.41362e-07 -8.13665e-12 -3.60666e-12" />
+                            <geom type="mesh" pos="5.55112e-17 0 6.46235e-27" quat="0.5 0.5 0.5 -0.5" mesh="link4" material="link4_material" />
+                            
+                            <body name="link5" pos="-0.065 2.22045e-16 3.08117e-17" quat="0.707107 4.21962e-16 0.707107 -2.22045e-16">
+                                <joint axis="0 0 1" name="link4-5_y" type="hinge" range="-3.1415926535897922 3.141592653589794" />
+                                <inertial pos="1.69993e-08 -0.00912064 -0.0305201" mass="0.08" fullinertia="4.35087e-05 4.90546e-05 3.25947e-05 -6.57471e-09 -3.58132e-10 4.82168e-06" />
+                                <geom type="mesh" pos="2.90566e-20 5.55112e-17 0.02" quat="0.707107 0.707107 -4.44089e-16 -4.28399e-16" mesh="link5" material="link5_material" />
+                                
+                                <body name="gripper" pos="2.71844e-20 -1.54511e-06 -0.066" quat="0.707107 -1.03681e-15 -0.707107 -1.11022e-16">
+                                    <joint axis="0 0 1" name="gripper_l" type="slide" range="-0.026 0.0" />
+                                    <inertial pos="-0.0128459 3.74811e-10 -0.00788501" mass="0.012" fullinertia="1.13475e-06 2.64639e-06 3.41713e-06 2.099e-14 2.97148e-07 -1.61132e-15" />
+                                    <geom type="mesh" pos="0 -1.11022e-16 -0.016" quat="0.707107 0.707107 5.55112e-16 -5.20151e-16" mesh="gripper" material="gripper_material" />
+                                </body>
+                                
+                                <body name="gripper_2" pos="2.71844e-20 -1.54511e-06 -0.066" quat="0.707107 -1.03681e-15 -0.707107 -1.11022e-16">
+                                    <joint axis="0 0 1" name="gripper_r" type="slide" range="0.0 0.026" />
+                                    <inertial pos="-0.0128459 -3.74811e-10 0.00788501" mass="0.012" fullinertia="1.13475e-06 2.64639e-06 3.41713e-06 -2.099e-14 -2.97148e-07 -1.61132e-15" />
+                                    <geom type="mesh" pos="0 0 0.016" quat="0.707107 -0.707107 -4.44089e-16 -4.51402e-16" mesh="gripper" material="gripper_material" />
+                                </body>
+                            </body>
+                        </body>
+                    </body>
+                </body>
+            </body>
+        </body>
+    </worldbody>
+
+    <asset>
+        <mesh file="link1.stl" />
+        <mesh file="link2.stl" />
+        <mesh file="base.stl" />
+        <mesh file="gripper.stl" />
+        <mesh file="link5.stl" />
+        <mesh file="link3.stl" />
+        <mesh file="link4.stl" />
+        <material name="base_material" rgba="0.188235 0.231373 0.588235 1" />
+        <material name="link1_material" rgba="0.266667 0.588235 0.282353 1" />
+        <material name="link2_material" rgba="1 0 0 1" />
+        <material name="link3_material" rgba="0.909804 0.678431 0.137255 1" />
+        <material name="link4_material" rgba="0.984314 0.545098 0.137255 1" />
+        <material name="link5_material" rgba="0.827451 0.203922 0.47451 1" />
+        <material name="gripper_material" rgba="0.0784314 0.639216 0.780392 1" />
+    </asset>
+
+    <actuator>
+        <position class="wx200" name="base-1_z" joint="base-1_z" inheritrange="1"/>
+        <position class="wx200" name="link1-2_x" joint="link1-2_x" inheritrange="1" />
+        <position class="wx200" name="link2-3_x" joint="link2-3_x" inheritrange="1" />
+        <position class="wx200" name="link3-4_x" joint="link3-4_x" inheritrange="1" />
+        <position class="wx200" name="link4-5_y" joint="link4-5_y" inheritrange="1" />
+        <position class="wx200" name="gripper_l" joint="gripper_l" inheritrange="1" />
+    </actuator>
+    
+    <equality>
+        <joint joint1="gripper_l" joint2="gripper_r" polycoef="0 -1 0 0 0"/>
+    </equality>
+    
+    <contact>
+        <exclude body1="base" body2="link1"/>
+    </contact>
+</mujoco>
