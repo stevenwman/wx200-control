@@ -12,7 +12,7 @@ https://cad.onshape.com/documents/e3921f789fe40c0afb5d0772/w/3040b45b657884b455f
     </default>
 
     <worldbody>
-        <body name="base" pos="0 0 0" quat="1 0 0 0" childclass="wx200">
+        <body name="base" pos="0 0 0" quat="0.7071 0 0 0.7071" childclass="wx200">
             <inertial pos="2.70131e-07 -0.00824666 0.0264502" mass="0.976"
                 fullinertia="0.00354168 0.00116937 0.00397238 -3.59126e-08 1.26053e-09 0.000264141" />
             <geom type="mesh" pos="0 -0.040232 1.1921e-10" quat="1 0 0 0" mesh="base"
@@ -60,7 +60,7 @@ https://cad.onshape.com/documents/e3921f789fe40c0afb5d0772/w/3040b45b657884b455f
                                     quat="0.707107 0.707107 -4.44089e-16 -4.28399e-16" mesh="link5"
                                     material="link5_material" />
 
-                                <site name="attachment_site" pos="0 0 0" />
+                                <site name="attachment_site" pos="0 0 -0.1" />
 
                                 <body name="gripper" pos="2.71844e-20 -1.54511e-06 -0.066"
                                     quat="0.707107 -1.03681e-15 -0.707107 -1.11022e-16">
@@ -115,6 +115,13 @@ https://cad.onshape.com/documents/e3921f789fe40c0afb5d0772/w/3040b45b657884b455f
         <position class="wx200" name="link3-4_x" joint="link3-4_x" inheritrange="1" />
         <position class="wx200" name="link4-5_y" joint="link4-5_y" inheritrange="1" />
         <position class="wx200" name="gripper_l" joint="gripper_l" inheritrange="1" />
+
+        <!-- <motor class="wx200" name="base-1_z" joint="base-1_z"/>
+        <motor class="wx200" name="link1-2_x" joint="link1-2_x"/>
+        <motor class="wx200" name="link2-3_x" joint="link2-3_x"/>
+        <motor class="wx200" name="link3-4_x" joint="link3-4_x"/>
+        <motor class="wx200" name="link4-5_y" joint="link4-5_y"/>
+        <motor class="wx200" name="gripper_l" joint="gripper_l"/> -->
     </actuator>
 
     <equality>
