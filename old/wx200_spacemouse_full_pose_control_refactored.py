@@ -1,6 +1,9 @@
 """
-WX200 robot position control using SpaceMouse.
-Simple world-frame velocity control for the end-effector site position only.
+WX200 robot full pose control using SpaceMouse (refactored version).
+
+This version uses a modular EndEffectorPoseController class that takes 6-vector
+velocity commands and produces mink-compatible targets. This makes it easy to
+replace SpaceMouse input with neural network predictions.
 """
 from pathlib import Path
 import multiprocessing as mp
@@ -10,9 +13,10 @@ import mujoco.viewer
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from loop_rate_limiters import RateLimiter
-
+import time
 import mink
 from spacemouse_reader import spacemouse_process
+from ee_pose_controller import EndEffectorPoseController
 
 _HERE = Path(__file__).parent
 _XML = _HERE / "wx200" / "scene.xml"
@@ -25,6 +29,7 @@ MAX_ITERS = 20
 
 # SpaceMouse scaling for velocity control
 VELOCITY_SCALE = 0.5  # m/s per unit SpaceMouse input
+ANGULAR_VELOCITY_SCALE = 0.5  # rad/s per unit SpaceMouse rotation input
 
 
 def converge_ik(
@@ -47,6 +52,7 @@ def converge_ik(
             return True
     return False
 
+
 def add_world_frame_axes(scene, origin, length=0.15):
     """
     Add world frame coordinate axes (X, Y, Z) as colored arrows.
@@ -64,6 +70,7 @@ def add_world_frame_axes(scene, origin, length=0.15):
     z_end = origin + np.array([0, 0, length])
     add_visual_arrow(scene, origin, z_end, radius=0.003, rgba=(0.0, 0.0, 1.0, 0.8))
 
+
 def add_visual_arrow(scene, from_point, to_point, radius=0.001, rgba=(0, 0, 1, 1)):
     """Adds a single visual arrow to the mjvScene."""
     if scene.ngeom >= scene.maxgeom:
@@ -78,23 +85,26 @@ def add_visual_arrow(scene, from_point, to_point, radius=0.001, rgba=(0, 0, 1, 1
                          radius, from_point, to_point)
     scene.ngeom += 1
 
+
 # Global trajectory history for velocity arrows (max 100 entries)
 _velocity_trajectory = []
 _MAX_TRAJECTORY_ARROWS = 100
 
-def update_velocity_visualization(scene, velocity_world, ee_pos):
+
+def update_velocity_visualization(scene, velocity_world, angular_velocity_world, ee_pos):
     """
-    Visualize the world-frame velocity command with trajectory history.
+    Visualize the world-frame velocity and angular velocity commands with trajectory history.
     Maintains a history of the last MAX_TRAJECTORY_ARROWS velocity commands.
     
     Args:
         scene: mjvScene to add arrows to
         velocity_world: [vx, vy, vz] velocity in world frame (m/s)
+        angular_velocity_world: [wx, wy, wz] angular velocity in world frame (rad/s)
         ee_pos: End-effector position in world frame
     """
     global _velocity_trajectory
     
-    # Velocity arrow: shows commanded linear velocity in world frame
+    # Linear velocity arrow: shows commanded linear velocity in world frame
     vel_magnitude = np.linalg.norm(velocity_world)
     if vel_magnitude > 0.001:
         # Velocity is in world frame - no transformation needed
@@ -126,7 +136,7 @@ def update_velocity_visualization(scene, velocity_world, ee_pos):
         if len(_velocity_trajectory) > _MAX_TRAJECTORY_ARROWS:
             _velocity_trajectory.pop(0)  # Remove oldest arrow
     
-    # Draw all arrows in trajectory history
+    # Draw all linear velocity arrows in trajectory history
     # Fade older arrows (reduce alpha based on age)
     for i, arrow_data in enumerate(_velocity_trajectory):
         # Calculate fade: newer arrows are brighter, older ones fade
@@ -140,6 +150,40 @@ def update_velocity_visualization(scene, velocity_world, ee_pos):
             radius=arrow_data['radius'],
             rgba=(0.0, 1.0, 1.0, alpha)  # Cyan with fading alpha
         )
+    
+    # Angular velocity arrow: shows commanded angular velocity in world frame
+    # This arrow should ALWAYS point in the world frame direction of rotation
+    # e.g., if rotating about +z world, arrow points UP regardless of EE pose
+    omega_magnitude = np.linalg.norm(angular_velocity_world)
+    if omega_magnitude > 0.01:
+        # Angular velocity is in world frame - no transformation needed
+        omega_world = angular_velocity_world
+        
+        # Scale arrow length based on magnitude
+        arrow_scale = 0.15  # Visual scaling factor (meters per rad/s)
+        arrow_length = omega_magnitude * arrow_scale
+        
+        # Arrow direction in world frame (normalized)
+        # This is the axis of rotation in world coordinates
+        arrow_dir = omega_world / omega_magnitude
+        
+        # Arrow start and end points (centered at end-effector)
+        arrow_start = ee_pos.copy()
+        arrow_end = arrow_start + arrow_dir * arrow_length
+        
+        # Arrow radius scales with magnitude
+        arrow_radius = 0.004 + omega_magnitude * 0.02
+        
+        # Add angular velocity arrow (magenta/purple color)
+        # Arrow points in the direction of the rotation axis in world frame
+        add_visual_arrow(
+            scene,
+            arrow_start,
+            arrow_end,
+            radius=arrow_radius,
+            rgba=(1.0, 0.0, 1.0, 0.8)  # Magenta for angular velocity
+        )
+
 
 def main():
     # Load model & data
@@ -149,12 +193,12 @@ def main():
     # Create a Mink configuration
     configuration = mink.Configuration(model)
 
-    # Define tasks - position control only (no orientation)
+    # Define tasks - position and orientation control
     end_effector_task = mink.FrameTask(
         frame_name="attachment_site",
         frame_type="site",
         position_cost=1.0,
-        orientation_cost=0.0,  # Disable orientation control
+        orientation_cost=0.1,  # Enable orientation control
         lm_damping=1.0,
     )
     posture_task = mink.PostureTask(model=model, cost=1e-2)
@@ -163,19 +207,23 @@ def main():
     # Create queue for spacemouse data
     data_queue = mp.Queue(maxsize=5)
     
-    # Start spacemouse reader process (only translation, ignore rotation)
+    # Start spacemouse reader process (translation + rotation for end-effector)
     spacemouse_proc = mp.Process(
         target=spacemouse_process,
-        args=(data_queue, VELOCITY_SCALE, 0.0)  # No rotation scale
+        args=(data_queue, VELOCITY_SCALE, ANGULAR_VELOCITY_SCALE)  # Translation and rotation scales
     )
     spacemouse_proc.start()
-    print("SpaceMouse process started (Position Control Only - World Frame)")
+    print("SpaceMouse process started (Position + Orientation Control)")
     print("Translation: Pushing forward = world +X, right = world +Y, up = world +Z")
+    print("Rotation: Roll/Pitch/Yaw = world frame angular velocity [wx, wy, wz]")
+    print("  - Z-twist (yaw) should make purple arrow point UP (+Z world)")
+    print("  - Purple arrow shows angular velocity direction in world frame")
 
     # Initialize viewer in passive mode
     with mujoco.viewer.launch_passive(
         model=model, data=data, show_left_ui=False, show_right_ui=False
     ) as viewer:
+
         mujoco.mjv_defaultFreeCamera(model, viewer.cam)
 
         # Reset simulation data to the 'home' keyframe
@@ -187,11 +235,25 @@ def main():
         # Get site ID
         site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
         
-        # Initialize target position from current site
+        # Initialize target position and orientation from current site
         current_site_pos = data.site(site_id).xpos.copy()
-        target_position = current_site_pos.copy()
+        current_site_xmat = data.site(site_id).xmat.reshape(3, 3)
+        current_site_rot = R.from_matrix(current_site_xmat)
+        current_site_quat = current_site_rot.as_quat()  # [x, y, z, w]
+        current_site_quat_wxyz = np.array([
+            current_site_quat[3], 
+            current_site_quat[0], 
+            current_site_quat[1], 
+            current_site_quat[2]
+        ])  # [w, x, y, z]
         
-        print(f"Initial site position (world frame): {target_position}")
+        # Initialize the end-effector pose controller
+        pose_controller = EndEffectorPoseController(
+            initial_position=current_site_pos,
+            initial_orientation_quat_wxyz=current_site_quat_wxyz
+        )
+        
+        print(f"Initial site position (world frame): {current_site_pos}")
         print(f"World frame: X=Red, Y=Green, Z=Blue (see axes at origin)")
 
         # World frame reference position
@@ -200,8 +262,9 @@ def main():
 
         rate = RateLimiter(frequency=200.0, warn=False)
         
-        # Initialize velocity command
+        # Initialize velocity commands (will be updated from SpaceMouse)
         current_velocity_world = np.zeros(3)
+        current_angular_velocity_world = np.zeros(3)  # [wx, wy, wz] in world frame
         
         # Gripper control
         # gripper_l has a position actuator, gripper_r is coupled via equality constraint
@@ -217,10 +280,11 @@ def main():
 
         while viewer.is_running():
             dt = rate.dt
-
+            
             # Read spacemouse commands from queue
-            # Reset velocity to zero if no new command (prevents drift)
+            # Reset velocities to zero if no new command (prevents drift)
             current_velocity_world = np.zeros(3)
+            current_angular_velocity_world = np.zeros(3)
             
             if not data_queue.empty():
                 try:
@@ -232,6 +296,30 @@ def main():
                     vel_magnitude = np.linalg.norm(vel_raw)
                     if vel_magnitude > 0.001:  # Deadzone threshold
                         current_velocity_world = vel_raw
+                    
+                    # Extract rotation as angular velocity in world frame
+                    # Based on spacemouse_reader.py: rotation_twist = [roll, yaw, pitch]
+                    # SpaceMouse: roll = x-axis rotation, pitch = y-axis rotation, yaw = z-axis rotation
+                    # Map to world frame angular velocity: [wx, wy, wz] = [pitch, -roll, yaw] (x and y flipped)
+                    rotation_twist = twist_command.get('rotation', np.zeros(3))
+                    # rotation_twist is [roll, yaw, pitch] from spacemouse_reader
+                    # Map to world frame angular velocity: [wx, wy, wz] = [pitch, -roll, yaw] (x and y flipped)
+                    omega_raw = np.array([rotation_twist[2], -rotation_twist[0], rotation_twist[1]])  # [pitch, -roll, yaw] = [wx, wy, wz]
+                    
+                    # Negate to match CAD convention (opposite of SolidWorks behavior)
+                    omega_raw = -omega_raw
+                    
+                    # Apply deadzone for angular velocity
+                    omega_magnitude = np.linalg.norm(omega_raw)
+                    if omega_magnitude > 0.01:  # Deadzone threshold
+                        current_angular_velocity_world = omega_raw
+                        
+                        # Debug: print angular velocity when significant
+                        # When you twist +z on SpaceMouse, wz should be positive, arrow should point UP
+                        if abs(omega_raw[2]) > 0.05:  # z-component (wz)
+                            print(f"DEBUG: Angular velocity (world frame): {current_angular_velocity_world}")
+                            print(f"  wz={omega_raw[2]:.3f} (positive = rotate about +z world = arrow points UP)")
+                            print(f"  rotation_twist was: {rotation_twist}")
                     
                     # Handle gripper button toggle
                     button_state = twist_command.get('button', [])
@@ -266,22 +354,19 @@ def main():
                 except queue.Empty:
                     pass
 
-            # Integrate velocity to update target position in world frame
-            # target_pos = current_pos + velocity_world * dt
-            target_position = target_position + current_velocity_world * dt
+            # Update pose controller with velocity commands
+            # This is the key interface: 6-vector input -> mink-compatible target
+            pose_controller.update_from_velocity_command(
+                velocity_world=current_velocity_world,
+                angular_velocity_world=current_angular_velocity_world,
+                dt=dt
+            )
             
-            # Get current site orientation (keep it fixed, we're only controlling position)
-            current_site_xmat = data.site(site_id).xmat.reshape(3, 3)
-            current_site_rot = R.from_matrix(current_site_xmat)
-            current_site_quat = current_site_rot.as_quat()  # [x, y, z, w]
-            current_site_quat_wxyz = np.array([current_site_quat[3], current_site_quat[0], 
-                                               current_site_quat[1], current_site_quat[2]])  # [w, x, y, z]
-            
-            # Set target for IK (position only, orientation stays at current)
-            target_pose = mink.SE3(np.concatenate([current_site_quat_wxyz, target_position]))
+            # Get target pose from controller and set for IK
+            target_pose = pose_controller.get_target_pose_se3()
             end_effector_task.set_target(target_pose)
 
-            # Attempt to converge IK
+            # Attempt to converge IK for position control
             converge_ik(
                 configuration,
                 tasks,
@@ -292,7 +377,7 @@ def main():
                 MAX_ITERS,
             )
 
-            # Set robot controls
+            # Set robot controls from IK (all 5 joints)
             data.ctrl[:5] = configuration.q[:5]
             
             # Set gripper control via data.ctrl
@@ -314,10 +399,11 @@ def main():
             
             # Add world frame reference axes (always visible at origin)
             add_world_frame_axes(scene, world_frame_pos, world_frame_length)
-            # Add velocity command visualization (with trajectory history)
+            # Add velocity and angular velocity command visualization (with trajectory history)
             update_velocity_visualization(
                 scene,
                 current_velocity_world,
+                current_angular_velocity_world,
                 current_site_pos
             )
 
