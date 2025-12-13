@@ -37,7 +37,6 @@ class SpaceMouseDriver:
         # Current state
         self.velocity_world = np.zeros(3)  # [vx, vy, vz] in world frame (m/s)
         self.angular_velocity_world = np.zeros(3)  # [wx, wy, wz] in world frame (rad/s)
-        self.gripper_open = True  # True = open, False = closed
         
         # Internal: multiprocessing setup
         self.data_queue = mp.Queue(maxsize=5)
@@ -59,7 +58,7 @@ class SpaceMouseDriver:
         print("SpaceMouse driver started")
         print("  Translation: Pushing forward = world +X, right = world +Y, up = world +Z")
         print("  Rotation: Roll/Pitch/Yaw = world frame angular velocity [wx, wy, wz]")
-        print("  Gripper: Left button = open, Right button = close")
+        print("  Gripper: Hold left button = open incrementally, Hold right button = close incrementally")
     
     def stop(self):
         """Stop the SpaceMouse reader process."""
@@ -112,21 +111,13 @@ class SpaceMouseDriver:
                 if omega_magnitude > self.angular_velocity_deadzone:
                     self.angular_velocity_world = omega_raw
                 
-                # Handle gripper buttons: left = open, right = close
+                # Handle gripper buttons: left = open incrementally, right = close incrementally
                 button_state = twist_command.get('button', [])
                 
-                # Left button (index 0) = open
+                # Left button (index 0) = open (when held)
                 left_button = len(button_state) > 0 and button_state[0] == 1
-                # Right button (index 1) = close
+                # Right button (index 1) = close (when held)
                 right_button = len(button_state) > 1 and button_state[1] == 1
-                
-                # Edge detection: set state on button press (not while held)
-                if left_button and not self.left_button_prev:
-                    self.gripper_open = True
-                    print("Gripper: OPENING")
-                elif right_button and not self.right_button_prev:
-                    self.gripper_open = False
-                    print("Gripper: CLOSING")
                 
                 self.left_button_prev = left_button
                 self.right_button_prev = right_button
@@ -163,24 +154,13 @@ class SpaceMouseDriver:
         """
         return np.concatenate([self.velocity_world, self.angular_velocity_world])
     
-    def get_gripper_state(self):
+    def get_gripper_button_states(self):
         """
-        Get current gripper state.
+        Get current gripper button states for incremental control.
         
         Returns:
-            bool: True if open, False if closed
+            tuple: (left_button_pressed, right_button_pressed)
+                - left_button_pressed: True if left button is currently held
+                - right_button_pressed: True if right button is currently held
         """
-        return self.gripper_open
-    
-    def get_gripper_target_position(self, open_position=-0.026, closed_position=0.0):
-        """
-        Get target gripper position based on current state.
-        
-        Args:
-            open_position: Position value when gripper is open
-            closed_position: Position value when gripper is closed
-        
-        Returns:
-            float: Target gripper position
-        """
-        return open_position if self.gripper_open else closed_position
+        return (self.left_button_prev, self.right_button_prev)

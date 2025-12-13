@@ -3,20 +3,7 @@ Dynamixel robot driver for sending joint commands to real hardware.
 """
 import time
 from dynamixel_sdk import *
-
-# Configuration
-BAUDRATE = 1000000
-DEVICENAME = '/dev/ttyUSB0'
-PROTOCOL_VERSION = 2.0
-
-# Addresses
-ADDR_TORQUE_ENABLE = 64
-ADDR_GOAL_POSITION = 116
-ADDR_PRESENT_POSITION = 132
-ADDR_PROFILE_VELOCITY = 112
-ADDR_PRESENT_CURRENT = 126  # 2 bytes, read-only
-
-MOTOR_IDS = [1, 2, 3, 4, 5, 6, 7]
+from robot_config import robot_config
 
 
 class RobotDriver:
@@ -24,16 +11,16 @@ class RobotDriver:
     Driver for controlling Dynamixel motors on the real robot.
     """
     
-    def __init__(self, devicename=DEVICENAME, baudrate=BAUDRATE):
+    def __init__(self, devicename=None, baudrate=None):
         """
         Initialize robot driver.
         
         Args:
-            devicename: Serial port device name (e.g., '/dev/ttyUSB0')
-            baudrate: Serial baudrate
+            devicename: Serial port device name (e.g., '/dev/ttyUSB0'). Defaults to robot_config.
+            baudrate: Serial baudrate. Defaults to robot_config.
         """
-        self.devicename = devicename
-        self.baudrate = baudrate
+        self.devicename = devicename if devicename is not None else robot_config.devicename
+        self.baudrate = baudrate if baudrate is not None else robot_config.baudrate
         self.portHandler = None
         self.packetHandler = None
         self.connected = False
@@ -52,7 +39,7 @@ class RobotDriver:
         rebooted_count = 0
         failed_motors = []
         
-        for dxl_id in MOTOR_IDS:
+        for dxl_id in robot_config.motor_ids:
             try:
                 dxl_comm_result, dxl_error = self.packetHandler.reboot(self.portHandler, dxl_id)
                 if dxl_comm_result == COMM_SUCCESS:
@@ -66,9 +53,9 @@ class RobotDriver:
                 failed_motors.append((dxl_id, str(e)))
         
         if rebooted_count > 0:
-            print(f"Rebooted {rebooted_count}/{len(MOTOR_IDS)} motors")
+            print(f"Rebooted {rebooted_count}/{len(robot_config.motor_ids)} motors")
         else:
-            print(f"WARNING: Failed to reboot any motors (0/{len(MOTOR_IDS)})")
+            print(f"WARNING: Failed to reboot any motors (0/{len(robot_config.motor_ids)})")
             if failed_motors:
                 print("Failed motors:")
                 for motor_id, error in failed_motors[:3]:  # Show first 3 errors
@@ -79,7 +66,7 @@ class RobotDriver:
     def connect(self):
         """Connect to robot, reboot motors to clear errors, and enable torque on all motors."""
         self.portHandler = PortHandler(self.devicename)
-        self.packetHandler = PacketHandler(PROTOCOL_VERSION)
+        self.packetHandler = PacketHandler(robot_config.protocol_version)
         
         # Open port
         if not self.portHandler.openPort():
@@ -93,9 +80,9 @@ class RobotDriver:
         self.reboot_all_motors()
         
         # Enable torque on all motors
-        for dxl_id in MOTOR_IDS:
+        for dxl_id in robot_config.motor_ids:
             dxl_comm_result, dxl_error = self.packetHandler.write1ByteTxRx(
-                self.portHandler, dxl_id, ADDR_TORQUE_ENABLE, 1
+                self.portHandler, dxl_id, robot_config.addr_torque_enable, 1
             )
             if dxl_comm_result != COMM_SUCCESS:
                 raise RuntimeError(f"Failed to enable torque on motor {dxl_id}: {self.packetHandler.getTxRxResult(dxl_comm_result)}")
@@ -120,9 +107,9 @@ class RobotDriver:
             return
         
         print("Disabling torque on all motors...")
-        for dxl_id in MOTOR_IDS:
+        for dxl_id in robot_config.motor_ids:
             self.packetHandler.write1ByteTxRx(
-                self.portHandler, dxl_id, ADDR_TORQUE_ENABLE, 0
+                self.portHandler, dxl_id, robot_config.addr_torque_enable, 0
             )
         print("Torque disabled")
     
@@ -138,12 +125,12 @@ class RobotDriver:
             raise RuntimeError("Not connected to robot")
         
         self.packetHandler.write4ByteTxRx(
-            self.portHandler, motor_id, ADDR_PROFILE_VELOCITY, velocity_limit
+            self.portHandler, motor_id, robot_config.addr_profile_velocity, velocity_limit
         )
     
     def set_profile_velocity_all(self, velocity_limit):
         """Set profile velocity for all motors."""
-        for motor_id in MOTOR_IDS:
+        for motor_id in robot_config.motor_ids:
             self.set_profile_velocity(motor_id, velocity_limit)
     
     def send_motor_positions(self, motor_positions, velocity_limit=30):
@@ -166,13 +153,13 @@ class RobotDriver:
         # Send position commands using TxOnly (no response wait) for low latency
         # This is fire-and-forget - much faster but no error checking
         for motor_id, goal_pos in motor_positions.items():
-            if motor_id not in MOTOR_IDS:
+            if motor_id not in robot_config.motor_ids:
                 continue  # Skip invalid IDs silently in hot loop
             
             # Use TxOnly (transmit only, no response) for maximum speed
             # This reduces latency from ~15ms per motor to ~1-2ms per motor
             self.packetHandler.write4ByteTxOnly(
-                self.portHandler, motor_id, ADDR_GOAL_POSITION, goal_pos
+                self.portHandler, motor_id, robot_config.addr_goal_position, goal_pos
             )
         
         # Note: Removed clearPort() from hot loop as it can cause port conflicts
@@ -193,7 +180,7 @@ class RobotDriver:
         
         try:
             result, comm_result, error = self.packetHandler.read2ByteTxRx(
-                self.portHandler, motor_id, ADDR_PRESENT_CURRENT
+                self.portHandler, motor_id, robot_config.addr_present_current
             )
             if comm_result == COMM_SUCCESS and error == 0:
                 current_raw = result

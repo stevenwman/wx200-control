@@ -19,17 +19,10 @@ from loop_rate_limiters import RateLimiter
 import mink
 from spacemouse_driver import SpaceMouseDriver
 from robot_controller import RobotController
+from robot_config import robot_config
 
 _HERE = Path(__file__).parent
 _XML = _HERE / "wx200" / "scene.xml"
-
-# SpaceMouse scaling
-VELOCITY_SCALE = 0.5  # m/s per unit SpaceMouse input
-ANGULAR_VELOCITY_SCALE = 0.5  # rad/s per unit SpaceMouse rotation input
-
-# Gripper positions
-GRIPPER_OPEN_POS = -0.026
-GRIPPER_CLOSED_POS = 0.0
 
 # Global trajectory history for velocity arrows (max 100 entries)
 _velocity_trajectory = []
@@ -115,11 +108,15 @@ def update_velocity_visualization(scene, velocity_world, angular_velocity_world,
             _velocity_trajectory.pop(0)  # Remove oldest arrow
     
     # Draw all linear velocity arrows in trajectory history
-    # Fade older arrows (reduce alpha based on age)
+    # Most recent arrow is fully opaque, older arrows fade to more transparent
     for i, arrow_data in enumerate(_velocity_trajectory):
-        # Calculate fade: newer arrows are brighter, older ones fade
-        age_ratio = i / max(len(_velocity_trajectory), 1)
-        alpha = 0.3 + 0.5 * (1.0 - age_ratio)  # Fade from 0.8 to 0.3
+        if i == len(_velocity_trajectory) - 1:
+            # Most recent arrow: fully opaque
+            alpha = 0.8
+        else:
+            # Older arrows: fade based on age (more transparent)
+            age_ratio = i / max(len(_velocity_trajectory) - 1, 1)
+            alpha = 0.01 + 0.02 * (1.0 - age_ratio)  # Fade from 0.3 to 0.1 for older arrows
         
         add_visual_arrow(
             scene,
@@ -201,8 +198,8 @@ def main():
         
         # Initialize SpaceMouse driver
         spacemouse = SpaceMouseDriver(
-            velocity_scale=VELOCITY_SCALE,
-            angular_velocity_scale=ANGULAR_VELOCITY_SCALE
+            velocity_scale=robot_config.velocity_scale,
+            angular_velocity_scale=robot_config.angular_velocity_scale
         )
         spacemouse.start()
         
@@ -228,6 +225,9 @@ def main():
         world_frame_pos = np.array([0.0, 0.0, 0.1])
         world_frame_length = 1.0
         
+        # Gripper incremental control state
+        gripper_current_position = robot_config.gripper_open_pos
+        
         try:
             while viewer.is_running():
                 dt = rate.dt
@@ -251,11 +251,19 @@ def main():
                 joint_commands = robot_controller.get_joint_commands(configuration, num_joints=5)
                 data.ctrl[:5] = joint_commands
                 
-                # Set gripper control
-                gripper_target = spacemouse.get_gripper_target_position(
-                    open_position=GRIPPER_OPEN_POS,
-                    closed_position=GRIPPER_CLOSED_POS
-                )
+                # Incremental gripper control (same logic as real robot)
+                left_button_pressed, right_button_pressed = spacemouse.get_gripper_button_states()
+                
+                if left_button_pressed:
+                    gripper_current_position -= robot_config.gripper_increment_rate
+                    gripper_current_position = max(gripper_current_position, robot_config.gripper_open_pos)
+                elif right_button_pressed:
+                    gripper_current_position += robot_config.gripper_increment_rate
+                    gripper_current_position = min(gripper_current_position, robot_config.gripper_closed_pos)
+                # If neither button pressed, maintain current position
+                
+                gripper_target = gripper_current_position
+                
                 if gripper_l_actuator_id >= 0 and gripper_l_actuator_id < model.nu:
                     data.ctrl[gripper_l_actuator_id] = gripper_target
                 
