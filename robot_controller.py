@@ -51,11 +51,11 @@ class RobotController:
         # This needs to be set before using the controller
         self._posture_target_initialized = False
         
-        # IK parameters
+        # IK parameters (optimized for low latency)
         self.solver = "quadprog"
         self.pos_threshold = 1e-4
         self.ori_threshold = 1e-4
-        self.max_iters = 20
+        self.max_iters = 5  # Reduced from 20 for lower latency (50Hz control, can iterate next frame)
     
     def initialize_posture_target(self, configuration):
         """

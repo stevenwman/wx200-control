@@ -42,7 +42,8 @@ class SpaceMouseDriver:
         # Internal: multiprocessing setup
         self.data_queue = mp.Queue(maxsize=5)
         self.spacemouse_proc = None
-        self.gripper_prev_button = False
+        self.left_button_prev = False
+        self.right_button_prev = False
         
         # Deadzone thresholds
         self.velocity_deadzone = 0.001
@@ -58,7 +59,7 @@ class SpaceMouseDriver:
         print("SpaceMouse driver started")
         print("  Translation: Pushing forward = world +X, right = world +Y, up = world +Z")
         print("  Rotation: Roll/Pitch/Yaw = world frame angular velocity [wx, wy, wz]")
-        print("  Gripper: Press SpaceMouse button to toggle open/close")
+        print("  Gripper: Left button = open, Right button = close")
     
     def stop(self):
         """Stop the SpaceMouse reader process."""
@@ -111,21 +112,24 @@ class SpaceMouseDriver:
                 if omega_magnitude > self.angular_velocity_deadzone:
                     self.angular_velocity_world = omega_raw
                 
-                # Handle gripper button toggle
+                # Handle gripper buttons: left = open, right = close
                 button_state = twist_command.get('button', [])
-                button_pressed = len(button_state) > 0 and (button_state[0] == 1 if len(button_state) > 0 else False)
                 
-                # Also check other button indices
-                if not button_pressed and len(button_state) > 1:
-                    button_pressed = button_state[1] == 1
+                # Left button (index 0) = open
+                left_button = len(button_state) > 0 and button_state[0] == 1
+                # Right button (index 1) = close
+                right_button = len(button_state) > 1 and button_state[1] == 1
                 
-                # Edge detection: toggle gripper on button press (not while held)
-                if button_pressed and not self.gripper_prev_button:
-                    self.gripper_open = not self.gripper_open
-                    state_str = "OPENING" if self.gripper_open else "CLOSING"
-                    print(f"Gripper: {state_str}")
+                # Edge detection: set state on button press (not while held)
+                if left_button and not self.left_button_prev:
+                    self.gripper_open = True
+                    print("Gripper: OPENING")
+                elif right_button and not self.right_button_prev:
+                    self.gripper_open = False
+                    print("Gripper: CLOSING")
                 
-                self.gripper_prev_button = button_pressed
+                self.left_button_prev = left_button
+                self.right_button_prev = right_button
                 
             except queue.Empty:
                 break
