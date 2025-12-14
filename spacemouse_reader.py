@@ -66,11 +66,13 @@ class SpaceMouseReader:
                         'timestamp': time.time()
                     }
                     
-                    # Put in queue (non-blocking, drop if queue is full)
+                    # Put in queue (non-blocking, drop oldest if queue is full)
+                    # This ensures we always have the latest command available, which is
+                    # important for responsive control. Older commands are dropped to prevent lag.
                     try:
                         self.data_queue.put_nowait(twist_command)
                     except queue.Full:
-                        # Drop old command if queue is full
+                        # Queue is full: drop oldest command and add new one
                         try:
                             self.data_queue.get_nowait()
                             self.data_queue.put_nowait(twist_command)

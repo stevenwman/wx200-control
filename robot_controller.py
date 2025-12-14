@@ -7,6 +7,7 @@ can work with both simulation and real robot hardware.
 import numpy as np
 import mink
 from ee_pose_controller import EndEffectorPoseController
+from robot_config import robot_config
 
 
 class RobotController:
@@ -42,7 +43,7 @@ class RobotController:
             frame_type="site",
             position_cost=position_cost,
             orientation_cost=orientation_cost,
-            lm_damping=1.0,
+            lm_damping=robot_config.ik_lm_damping,
         )
         self.posture_task = mink.PostureTask(model=model, cost=posture_cost)
         self.tasks = [self.end_effector_task, self.posture_task]
@@ -51,11 +52,11 @@ class RobotController:
         # This needs to be set before using the controller
         self._posture_target_initialized = False
         
-        # IK parameters (optimized for low latency)
-        self.solver = "quadprog"
-        self.pos_threshold = 1e-4
-        self.ori_threshold = 1e-4
-        self.max_iters = 5  # Reduced from 20 for lower latency (50Hz control, can iterate next frame)
+        # IK parameters (from config, optimized for low latency)
+        self.solver = robot_config.ik_solver
+        self.pos_threshold = robot_config.ik_pos_threshold
+        self.ori_threshold = robot_config.ik_ori_threshold
+        self.max_iters = robot_config.ik_max_iters
     
     def initialize_posture_target(self, configuration):
         """
@@ -103,6 +104,10 @@ class RobotController:
         """
         Run IK solver to converge to target pose.
         
+        Uses iterative solver with early termination if convergence is achieved.
+        This is optimized for low latency (50Hz control) - we use fewer iterations
+        than typical IK solvers, relying on the next control cycle to continue convergence.
+        
         Args:
             configuration: mink.Configuration to update
             dt: Time step (s)
@@ -114,7 +119,7 @@ class RobotController:
             vel = mink.solve_ik(configuration, self.tasks, dt, self.solver, 1e-3)
             configuration.integrate_inplace(vel, dt)
             
-            # Check convergence
+            # Check convergence (early termination if we're close enough)
             err = self.tasks[0].compute_error(configuration)
             pos_achieved = np.linalg.norm(err[:3]) <= self.pos_threshold
             ori_achieved = np.linalg.norm(err[3:]) <= self.ori_threshold

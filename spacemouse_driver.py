@@ -13,6 +13,7 @@ import multiprocessing as mp
 import queue
 import numpy as np
 from spacemouse_reader import spacemouse_process
+from robot_config import robot_config
 
 
 class SpaceMouseDriver:
@@ -35,8 +36,8 @@ class SpaceMouseDriver:
         self.angular_velocity_scale = angular_velocity_scale
         
         # Current state
-        self.velocity_world = np.zeros(3)  # [vx, vy, vz] in world frame (m/s)
-        self.angular_velocity_world = np.zeros(3)  # [wx, wy, wz] in world frame (rad/s)
+        self.velocity_world = np.zeros(3)
+        self.angular_velocity_world = np.zeros(3)
         
         # Internal: multiprocessing setup
         self.data_queue = mp.Queue(maxsize=5)
@@ -44,9 +45,9 @@ class SpaceMouseDriver:
         self.left_button_prev = False
         self.right_button_prev = False
         
-        # Deadzone thresholds
-        self.velocity_deadzone = 0.001
-        self.angular_velocity_deadzone = 0.01
+        # Deadzone thresholds (from config) - prevents drift from noise
+        self.velocity_deadzone = robot_config.velocity_deadzone
+        self.angular_velocity_deadzone = robot_config.angular_velocity_deadzone
     
     def start(self):
         """Start the SpaceMouse reader process."""
@@ -77,55 +78,46 @@ class SpaceMouseDriver:
             bool: True if new data was processed, False otherwise
         """
         # Reset velocities (prevents drift when no input)
-        self.velocity_world = np.zeros(3)
-        self.angular_velocity_world = np.zeros(3)
+        self.velocity_world.fill(0.0)
+        self.angular_velocity_world.fill(0.0)
         
-        data_updated = False
-        
-        # Process all available commands in queue
+        # Process all available commands in queue to get the latest one
+        # We drop older commands to ensure we're always using the most recent input,
+        # which is important for responsive control at high update rates
+        latest_command = None
         while not self.data_queue.empty():
             try:
-                twist_command = self.data_queue.get_nowait()
-                data_updated = True
-                
-                # Extract translation as velocity in world frame
-                vel_raw = twist_command['translation']
-                vel_magnitude = np.linalg.norm(vel_raw)
-                if vel_magnitude > self.velocity_deadzone:
-                    self.velocity_world = vel_raw
-                
-                # Extract rotation as angular velocity in world frame
-                # Based on spacemouse_reader.py: rotation_twist = [roll, yaw, pitch]
-                # Map to world frame: [wx, wy, wz] = [pitch, -roll, yaw] (x and y flipped)
-                rotation_twist = twist_command.get('rotation', np.zeros(3))
-                omega_raw = np.array([
-                    rotation_twist[2],   # pitch -> wx
-                    -rotation_twist[0],  # -roll -> wy
-                    rotation_twist[1]     # yaw -> wz
-                ])
-                
-                # Negate to match CAD convention (opposite of SolidWorks behavior)
-                omega_raw = -omega_raw
-                
-                omega_magnitude = np.linalg.norm(omega_raw)
-                if omega_magnitude > self.angular_velocity_deadzone:
-                    self.angular_velocity_world = omega_raw
-                
-                # Handle gripper buttons: left = open incrementally, right = close incrementally
-                button_state = twist_command.get('button', [])
-                
-                # Left button (index 0) = open (when held)
-                left_button = len(button_state) > 0 and button_state[0] == 1
-                # Right button (index 1) = close (when held)
-                right_button = len(button_state) > 1 and button_state[1] == 1
-                
-                self.left_button_prev = left_button
-                self.right_button_prev = right_button
-                
+                latest_command = self.data_queue.get_nowait()
             except queue.Empty:
                 break
         
-        return data_updated
+        if latest_command is None:
+            return False
+        
+        # Extract translation as velocity in world frame
+        vel_raw = latest_command['translation']
+        vel_magnitude = np.linalg.norm(vel_raw)
+        if vel_magnitude > self.velocity_deadzone:
+            self.velocity_world = vel_raw
+        
+        # Extract rotation as angular velocity in world frame
+        # SpaceMouse provides [roll, yaw, pitch], we map to world frame [wx, wy, wz]
+        # Mapping: [wx, wy, wz] = [pitch, -roll, yaw] (x and y axes are swapped)
+        # Then negate to match CAD convention (opposite of SolidWorks behavior)
+        rotation_twist = latest_command.get('rotation', np.zeros(3))
+        omega_raw = np.array([rotation_twist[2], -rotation_twist[0], rotation_twist[1]])
+        omega_raw = -omega_raw
+        
+        omega_magnitude = np.linalg.norm(omega_raw)
+        if omega_magnitude > self.angular_velocity_deadzone:
+            self.angular_velocity_world = omega_raw
+        
+        # Handle gripper buttons
+        button_state = latest_command.get('button', [])
+        self.left_button_prev = len(button_state) > 0 and button_state[0] == 1
+        self.right_button_prev = len(button_state) > 1 and button_state[1] == 1
+        
+        return True
     
     def get_velocity_command(self):
         """

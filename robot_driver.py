@@ -151,19 +151,18 @@ class RobotDriver:
             self._last_velocity_limit = velocity_limit
         
         # Send position commands using TxOnly (no response wait) for low latency
-        # This is fire-and-forget - much faster but no error checking
+        # TxOnly is fire-and-forget: ~1-2ms per motor vs ~15ms for TxRx
+        # Trade-off: faster control loop but no error checking in hot path
         for motor_id, goal_pos in motor_positions.items():
             if motor_id not in robot_config.motor_ids:
                 continue  # Skip invalid IDs silently in hot loop
             
-            # Use TxOnly (transmit only, no response) for maximum speed
-            # This reduces latency from ~15ms per motor to ~1-2ms per motor
             self.packetHandler.write4ByteTxOnly(
                 self.portHandler, motor_id, robot_config.addr_goal_position, goal_pos
             )
         
-        # Note: Removed clearPort() from hot loop as it can cause port conflicts
-        # The port will be flushed automatically on next operation
+        # Note: We don't call clearPort() here as it can cause port conflicts.
+        # The port state will be flushed when transitioning to TxRx mode (e.g., shutdown).
     
     def read_present_current(self, motor_id):
         """
@@ -184,23 +183,22 @@ class RobotDriver:
             )
             if comm_result == COMM_SUCCESS and error == 0:
                 current_raw = result
-                # Current is signed 16-bit (two's complement)
-                # Handle signed 16-bit: values >= 32768 are negative
+                
+                # Convert unsigned 16-bit to signed 16-bit (two's complement)
+                # Values >= 32768 represent negative numbers
                 if current_raw >= 32768:
                     current_raw_signed = current_raw - 65536
                 else:
                     current_raw_signed = current_raw
                 
-                # For XM430/XM540: 1 unit = 2.69 mA
-                # But the raw value might be in a different format
-                # Let's try: if raw value seems too high, maybe it's already in 0.1A units
-                # Test: if abs(raw) > 1000, assume it's in 0.1A units (divide by 10)
-                # Otherwise use the 2.69 conversion
+                # Convert to milliamps based on value magnitude
+                # Large values (>1000) are likely in 0.1A units, small values use 2.69 mA/unit
+                # This heuristic handles different Dynamixel firmware versions
                 if abs(current_raw_signed) > 1000:
-                    # Likely in 0.1A units (100mA per unit), convert to mA
-                    current_ma = abs(current_raw_signed) * 0.1 * 1000  # Convert 0.1A units to mA
+                    # Value is in 0.1A units: multiply by 0.1 to get amps, then by 1000 for mA
+                    current_ma = abs(current_raw_signed) * 0.1 * 1000
                 else:
-                    # Use standard conversion: 1 unit = 2.69 mA
+                    # Standard XM430/XM540 conversion: 1 unit = 2.69 mA
                     current_ma = abs(current_raw_signed) * 2.69
                 
                 return current_ma

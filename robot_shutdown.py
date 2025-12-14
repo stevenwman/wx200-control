@@ -25,9 +25,13 @@ def shutdown_sequence(robot_driver, velocity_limit=30):
         return
     
     # Flush port before shutdown (transition from TxOnly to TxRx mode)
+    # The control loop uses write4ByteTxOnly (fire-and-forget) which doesn't wait for responses.
+    # This can leave the port in a "pending" state. We need to do a TxRx operation to clear
+    # this state before the shutdown sequence (which uses TxRx) can work properly.
     if robot_driver.portHandler:
         try:
             flush_success = False
+            # Try to flush by doing a read operation (TxRx)
             for attempt in range(3):
                 try:
                     result, comm_result, error = robot_driver.packetHandler.read4ByteTxRx(
@@ -40,15 +44,16 @@ def shutdown_sequence(robot_driver, velocity_limit=30):
                 except Exception:
                     time.sleep(0.3)
             
+            # If flush failed, try closing and reopening the port
             if not flush_success:
                 try:
                     robot_driver.portHandler.closePort()
                     time.sleep(0.6)
                     if robot_driver.portHandler.openPort():
-                        baudrate = getattr(robot_driver, 'baudrate', 1000000)
-                        if robot_driver.portHandler.setBaudRate(baudrate):
+                        if robot_driver.portHandler.setBaudRate(robot_driver.baudrate):
                             robot_driver.portHandler.clearPort()
                             time.sleep(0.4)
+                            flush_success = True
                 except Exception:
                     pass
             
@@ -56,7 +61,7 @@ def shutdown_sequence(robot_driver, velocity_limit=30):
         except Exception:
             pass
         
-        # Now close the old port handler
+        # Close the old port handler (we'll create a fresh one for shutdown)
         try:
             robot_driver.portHandler.closePort()
             time.sleep(0.5)
@@ -64,12 +69,15 @@ def shutdown_sequence(robot_driver, velocity_limit=30):
             pass
     
     devicename = robot_driver.devicename
-    baudrate = getattr(robot_driver, 'baudrate', 1000000)
+    baudrate = robot_driver.baudrate
     
+    # Create fresh port handler for shutdown sequence
+    # This is necessary because the control loop uses TxOnly (fire-and-forget) mode,
+    # which can leave the port in an inconsistent state. A fresh port handler ensures
+    # clean TxRx communication for the shutdown sequence.
     from dynamixel_sdk import PortHandler, PacketHandler
-    PROTOCOL_VERSION = 2.0
     portHandler = PortHandler(devicename)
-    packetHandler = PacketHandler(PROTOCOL_VERSION)
+    packetHandler = PacketHandler(robot_config.protocol_version)
     
     if not portHandler.openPort():
         print("ERROR: Failed to open port for shutdown", flush=True)
@@ -183,7 +191,7 @@ def reboot_motors(robot_driver):
             return
         
         devicename = robot_driver.devicename
-        baudrate = getattr(robot_driver, 'baudrate', 1000000)
+        baudrate = robot_driver.baudrate
         
         if robot_driver.portHandler:
             try:
@@ -193,9 +201,8 @@ def reboot_motors(robot_driver):
                 pass
         
         from dynamixel_sdk import PortHandler, PacketHandler
-        PROTOCOL_VERSION = 2.0
         portHandler = PortHandler(devicename)
-        packetHandler = PacketHandler(PROTOCOL_VERSION)
+        packetHandler = PacketHandler(robot_config.protocol_version)
         
         if portHandler.openPort():
             if portHandler.setBaudRate(baudrate):

@@ -26,6 +26,25 @@ class RobotConfig:
     devicename: str = '/dev/ttyUSB0'
     protocol_version: float = 2.0
     
+    # Encoder parameters
+    encoder_max: int = 4095  # 12-bit encoder range
+    encoder_center: int = 2048  # Middle position (180 degrees)
+    
+    # Gripper encoder range (measured actual range)
+    gripper_encoder_min: int = 1559  # Closed position
+    gripper_encoder_max: int = 2776  # Open position
+    
+    # IK solver parameters (optimized for low latency)
+    ik_max_iters: int = 5  # Reduced from 20 for 50Hz control
+    ik_pos_threshold: float = 1e-4
+    ik_ori_threshold: float = 1e-4
+    ik_solver: str = "quadprog"
+    ik_lm_damping: float = 1.0
+    
+    # SpaceMouse deadzones
+    velocity_deadzone: float = 0.001
+    angular_velocity_deadzone: float = 0.01
+    
     # SpaceMouse scaling
     velocity_scale: float = 0.5  # m/s per unit SpaceMouse input
     angular_velocity_scale: float = 0.5  # rad/s per unit SpaceMouse rotation input
