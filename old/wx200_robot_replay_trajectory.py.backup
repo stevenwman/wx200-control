@@ -1,0 +1,261 @@
+"""
+WX200 real robot trajectory replay.
+
+Replays recorded trajectories on the real robot by applying the recorded actions
+(velocity commands) at the same frequency as recording.
+
+Flow:
+1. Startup: Move robot to sim keyframe home position
+2. Main loop: Load trajectory → Apply recorded actions → Send to robot
+3. Shutdown: Execute safe exit sequence
+
+Usage:
+    python wx200_real_robot_replay_trajectory.py TRAJECTORY_FILE.npz
+    
+    TRAJECTORY_FILE.npz: Path to trajectory file saved by recording script
+"""
+from pathlib import Path
+import mujoco
+import numpy as np
+from scipy.spatial.transform import Rotation as R
+from loop_rate_limiters import RateLimiter
+import mink
+import time
+import argparse
+from robot_control.robot_controller import RobotController
+from robot_control.robot_joint_to_motor import JointToMotorTranslator
+from robot_control.robot_driver import RobotDriver
+from robot_control.robot_shutdown import shutdown_sequence, reboot_motors
+from robot_control.robot_startup import startup_sequence
+from robot_control.robot_config import robot_config
+from robot_control.robot_joint_to_motor import sync_robot_to_mujoco
+
+_HERE = Path(__file__).parent
+_XML = _HERE / "wx200" / "scene.xml"
+
+
+def get_sim_home_pose(model):
+    """Get the home pose from sim keyframe."""
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, model.key("home").id)
+    mujoco.mj_forward(model, data)
+    
+    qpos = data.qpos.copy()
+    
+    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
+    position = data.site(site_id).xpos.copy()
+    current_site_xmat = data.site(site_id).xmat.reshape(3, 3)
+    current_site_rot = R.from_matrix(current_site_xmat)
+    current_site_quat = current_site_rot.as_quat()
+    orientation_quat_wxyz = np.array([
+        current_site_quat[3], 
+        current_site_quat[0], 
+        current_site_quat[1], 
+        current_site_quat[2]
+    ])
+    
+    return qpos, position, orientation_quat_wxyz
+
+
+def load_trajectory(trajectory_path):
+    """
+    Load trajectory data from NPZ file.
+    
+    Args:
+        trajectory_path: Path to trajectory NPZ file
+        
+    Returns:
+        dict with keys: 'timestamps', 'states', 'actions', 'metadata'
+    """
+    data = np.load(trajectory_path, allow_pickle=True)
+    
+    trajectory = {
+        'timestamps': data['timestamps'],
+        'states': data['states'],
+        'actions': data['actions'],
+        'metadata': data['metadata'].item() if 'metadata' in data else {}
+    }
+    
+    print(f"\n✓ Loaded trajectory from: {trajectory_path}")
+    print(f"  - {len(trajectory['timestamps'])} samples")
+    print(f"  - Duration: {trajectory['timestamps'][-1]:.2f} seconds")
+    if 'control_frequency' in trajectory['metadata']:
+        print(f"  - Recorded frequency: {trajectory['metadata']['control_frequency']:.1f} Hz")
+    
+    return trajectory
+
+
+def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='WX200 Real Robot Trajectory Replay')
+    parser.add_argument('trajectory_file', type=str,
+                       help='Path to trajectory NPZ file to replay')
+    parser.add_argument('--start-index', type=int, default=0,
+                       help='Start replaying from this index (default: 0)')
+    parser.add_argument('--end-index', type=int, default=None,
+                       help='Stop replaying at this index (default: end of trajectory)')
+    args = parser.parse_args()
+    
+    trajectory_path = Path(args.trajectory_file)
+    if not trajectory_path.exists():
+        print(f"Error: Trajectory file not found: {trajectory_path}")
+        return
+    
+    print("WX200 Real Robot Trajectory Replay")
+    print("="*60)
+    print(f"Trajectory file: {trajectory_path}")
+    print("="*60)
+    
+    # Load trajectory
+    trajectory = load_trajectory(trajectory_path)
+    
+    # Determine replay range
+    start_idx = args.start_index
+    end_idx = args.end_index if args.end_index is not None else len(trajectory['timestamps'])
+    end_idx = min(end_idx, len(trajectory['timestamps']))
+    
+    if start_idx >= end_idx:
+        print(f"Error: Invalid range: start_index={start_idx}, end_index={end_idx}")
+        return
+    
+    print(f"\nReplay range: indices {start_idx} to {end_idx-1} ({end_idx - start_idx} samples)")
+    print(f"Estimated duration: {trajectory['timestamps'][end_idx-1] - trajectory['timestamps'][start_idx]:.2f} seconds")
+    
+    # Load model for IK (needed for robot controller)
+    model = mujoco.MjModel.from_xml_path(_XML.as_posix())
+    data = mujoco.MjData(model)
+    configuration = mink.Configuration(model)
+    
+    home_qpos, home_position, home_orientation_quat_wxyz = get_sim_home_pose(model)
+    print(f"\nSim home pose - EE position: {home_position}")
+    
+    robot_driver = RobotDriver()
+    
+    try:
+        print("\nConnecting to robot...")
+        robot_driver.connect()
+        
+        translator = JointToMotorTranslator(
+            joint1_motor2_offset=0,
+            joint1_motor3_offset=0
+        )
+        
+        # Execute startup sequence
+        robot_joint_angles, actual_position, actual_orientation_quat_wxyz, home_motor_positions = startup_sequence(
+            robot_driver, translator, model, data, configuration, home_qpos=home_qpos
+        )
+        
+        print("\n" + "="*60)
+        print("✓ Robot is now at home position")
+        print("Ready to replay trajectory!")
+        print("Press Ctrl+C to stop and execute shutdown sequence")
+        print("="*60 + "\n")
+        
+        # Initialize robot controller with actual robot pose
+        robot_controller = RobotController(
+            model=model,
+            initial_position=actual_position,
+            initial_orientation_quat_wxyz=actual_orientation_quat_wxyz,
+            position_cost=1.0,
+            orientation_cost=0.1,
+            posture_cost=1e-2
+        )
+        
+        # Initialize posture target with actual robot configuration
+        robot_controller.initialize_posture_target(configuration)
+        
+        # Also reset the pose controller target to match actual robot pose
+        # This ensures the target starts at the actual robot position
+        robot_controller.reset_pose(actual_position, actual_orientation_quat_wxyz)
+        
+        # CRITICAL: Set the end-effector task target to match current configuration
+        # This ensures IK doesn't try to move from current position
+        current_target_pose = robot_controller.get_target_pose()
+        robot_controller.end_effector_task.set_target(current_target_pose)
+        
+        # Control rate limiter - use recorded frequency if available, otherwise use config
+        recorded_freq = trajectory['metadata'].get('control_frequency', robot_config.control_frequency)
+        control_rate = RateLimiter(frequency=recorded_freq, warn=False)
+        control_loop_active = True
+        
+        # Replay trajectory
+        current_idx = start_idx
+        replay_start_time = time.perf_counter()
+        
+        print(f"\nStarting replay at {recorded_freq:.1f} Hz...")
+        print("="*60 + "\n")
+        
+        try:
+            while control_loop_active and current_idx < end_idx:
+                dt = control_rate.dt
+                
+                # Get action from trajectory
+                action = trajectory['actions'][current_idx]
+                velocity_world = action[:3]  # [vx, vy, vz]
+                angular_velocity_world = action[3:6]  # [wx, wy, wz]
+                gripper_target = action[6]  # Gripper target from recorded action
+                
+                # Update robot controller with recorded velocity commands
+                robot_controller.update_from_velocity_command(
+                    velocity_world=velocity_world,
+                    angular_velocity_world=angular_velocity_world,
+                    dt=dt,
+                    configuration=configuration
+                )
+                
+                # Get joint commands from IK
+                joint_commands_rad = configuration.q[:5]
+                
+                # Convert joint commands to motor positions
+                motor_positions = translator.joint_commands_to_motor_positions(
+                    joint_angles_rad=joint_commands_rad,
+                    gripper_position=gripper_target
+                )
+                
+                # Send motor commands to robot
+                robot_driver.send_motor_positions(motor_positions, velocity_limit=robot_config.velocity_limit)
+                
+                # Move to next sample
+                current_idx += 1
+                
+                # Print progress every second
+                if current_idx % int(recorded_freq) == 0:
+                    elapsed = time.perf_counter() - replay_start_time
+                    progress = (current_idx - start_idx) / (end_idx - start_idx) * 100
+                    print(f"Replay progress: {current_idx}/{end_idx} ({progress:.1f}%) - Elapsed: {elapsed:.1f}s")
+                
+                control_rate.sleep()
+            
+            print(f"\n✓ Replay complete! ({current_idx - start_idx} samples)")
+        
+        except KeyboardInterrupt:
+            print(f"\n\nKeyboard interrupt detected. Stopped at index {current_idx}/{end_idx}")
+        
+        finally:
+            control_loop_active = False
+            time.sleep(0.3)
+            
+            # Execute shutdown sequence
+            try:
+                shutdown_sequence(robot_driver, velocity_limit=robot_config.velocity_limit)
+            except Exception as e:
+                print(f"Error during shutdown sequence: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    except KeyboardInterrupt:
+        print("\n\nKeyboard interrupt detected during initialization...")
+    
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        # Reboot motors after shutdown
+        reboot_motors(robot_driver)
+        robot_driver.disconnect()
+
+
+if __name__ == "__main__":
+    main()

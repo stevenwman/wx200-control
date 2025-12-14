@@ -1,0 +1,295 @@
+"""
+WX200 Real Robot Teleop Control with SpaceMouse
+
+This script provides real-time control of the WX200 robot using SpaceMouse input.
+Features:
+- SpaceMouse 6-DoF control (translation and rotation)
+- Incremental gripper control (hold buttons to open/close)
+- Safe startup and shutdown sequences
+- Automatic synchronization of simulation to actual robot position
+- Optional trajectory recording for BC training
+
+Usage:
+    python wx200_robot_teleop_control.py [--record] [--output OUTPUT_FILE]
+    
+    --record: Enable trajectory recording (optional)
+    --output: Output file path for trajectory (default: trajectory_YYYYMMDD_HHMMSS.npz)
+
+Press Ctrl+C to stop and execute shutdown sequence.
+"""
+import time
+import numpy as np
+import mujoco
+import mink
+import argparse
+from pathlib import Path
+from datetime import datetime
+from scipy.spatial.transform import Rotation as R
+
+from robot_control.robot_config import robot_config
+from robot_control.robot_driver import RobotDriver
+from robot_control.robot_controller import RobotController
+from robot_control.robot_joint_to_motor import JointToMotorTranslator, sync_robot_to_mujoco
+from robot_control.robot_shutdown import shutdown_sequence, reboot_motors
+from robot_control.robot_startup import startup_sequence
+from spacemouse.spacemouse_driver import SpaceMouseDriver
+from loop_rate_limiters import RateLimiter
+
+
+_XML = Path(__file__).parent / "wx200" / "scene.xml"
+
+
+def get_sim_home_pose(model):
+    """Get the home pose from sim keyframe."""
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, model.key("home").id)
+    mujoco.mj_forward(model, data)
+    
+    site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
+    home_position = data.site(site_id).xpos.copy()
+    home_site_xmat = data.site(site_id).xmat.reshape(3, 3)
+    home_site_rot = R.from_matrix(home_site_xmat)
+    home_site_quat = home_site_rot.as_quat()
+    home_orientation_quat_wxyz = np.array([
+        home_site_quat[3], 
+        home_site_quat[0], 
+        home_site_quat[1], 
+        home_site_quat[2]
+    ])
+    
+    qpos = data.qpos.copy()
+    return qpos, home_position, home_orientation_quat_wxyz
+
+
+def save_trajectory(trajectory, output_path):
+    """
+    Save trajectory data to NPZ file.
+    
+    Args:
+        trajectory: List of dicts with keys: 'timestamp', 'state', 'action'
+        output_path: Path to save the trajectory file
+    """
+    if not trajectory:
+        print("Warning: No trajectory data to save")
+        return
+    
+    # Convert to numpy arrays for efficient storage
+    timestamps = np.array([t['timestamp'] for t in trajectory])
+    states = np.array([t['state'] for t in trajectory])  # Shape: (N, 6) - 5 joints + gripper
+    actions = np.array([t['action'] for t in trajectory])  # Shape: (N, 6) - [vx,vy,vz,wx,wy,wz]
+    
+    # Save as NPZ (numpy compressed format)
+    np.savez_compressed(
+        output_path,
+        timestamps=timestamps,
+        states=states,
+        actions=actions,
+        metadata={
+            'num_samples': len(trajectory),
+            'control_frequency': robot_config.control_frequency,
+            'duration_seconds': timestamps[-1] if len(timestamps) > 0 else 0.0,
+            'state_dim': 6,  # 5 joints + gripper
+            'action_dim': 7,  # 3 linear + 3 angular velocities + gripper target
+            'state_labels': ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'gripper'],
+            'action_labels': ['vx', 'vy', 'vz', 'wx', 'wy', 'wz', 'gripper_target'],
+            'timestamp': datetime.now().isoformat()
+        }
+    )
+    
+    print(f"\n✓ Trajectory saved to: {output_path}")
+    print(f"  - {len(trajectory)} samples")
+    if len(timestamps) > 0 and timestamps[-1] > 0:
+        print(f"  - Duration: {timestamps[-1]:.2f} seconds")
+        print(f"  - Frequency: {len(trajectory) / timestamps[-1]:.2f} Hz")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='WX200 Real Robot Teleop Control')
+    parser.add_argument('--record', action='store_true', help='Enable trajectory recording')
+    parser.add_argument('--output', type=str, default=None, help='Output file path for trajectory')
+    args = parser.parse_args()
+    
+    ENABLE_RECORDING = args.record
+    if ENABLE_RECORDING and args.output is None:
+        # Generate default filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = Path(f"trajectory_{timestamp}.npz")
+    elif ENABLE_RECORDING:
+        output_path = Path(args.output)
+    else:
+        output_path = None
+    print("WX200 Real Robot Teleop Control")
+    print("="*60)
+    print("Features:")
+    print("- SpaceMouse control")
+    print("- Safe startup and shutdown sequences")
+    if ENABLE_RECORDING:
+        print(f"- Trajectory recording enabled")
+        print(f"- Output file: {output_path}")
+    print("="*60)
+    
+    model = mujoco.MjModel.from_xml_path(_XML.as_posix())
+    data = mujoco.MjData(model)
+    configuration = mink.Configuration(model)
+    
+    home_qpos, home_position, home_orientation_quat_wxyz = get_sim_home_pose(model)
+    print(f"\nSim home pose - EE position: {home_position}")
+    
+    robot_driver = RobotDriver()
+    
+    try:
+        print("\nConnecting to robot...")
+        robot_driver.connect()
+        
+        translator = JointToMotorTranslator(
+            joint1_motor2_offset=0,
+            joint1_motor3_offset=0
+        )
+        
+        # Execute startup sequence
+        robot_joint_angles, actual_position, actual_orientation_quat_wxyz, home_motor_positions = startup_sequence(
+            robot_driver, translator, model, data, configuration, home_qpos=home_qpos
+        )
+        
+        print(f"✓ Synced to actual robot position: {actual_position}")
+        
+        print("\n" + "="*60)
+        print("✓ Robot is now at home position")
+        print("Ready for SpaceMouse control!")
+        if ENABLE_RECORDING:
+            print("RECORDING: Trajectory will be saved on exit")
+        print("Press Ctrl+C to stop and execute shutdown sequence")
+        print("="*60 + "\n")
+        
+        spacemouse = SpaceMouseDriver(
+            velocity_scale=robot_config.velocity_scale,
+            angular_velocity_scale=robot_config.angular_velocity_scale
+        )
+        spacemouse.start()
+        
+        robot_controller = RobotController(
+            model=model,
+            initial_position=actual_position,
+            initial_orientation_quat_wxyz=actual_orientation_quat_wxyz,
+            position_cost=1.0,
+            orientation_cost=0.1,
+            posture_cost=1e-2
+        )
+        
+        # Initialize posture target with actual robot configuration
+        robot_controller.initialize_posture_target(configuration)
+        
+        # Reset the pose controller target to match actual robot pose
+        robot_controller.reset_pose(actual_position, actual_orientation_quat_wxyz)
+        
+        # Set the end-effector task target to match current configuration
+        current_target_pose = robot_controller.get_target_pose()
+        robot_controller.end_effector_task.set_target(current_target_pose)
+        
+        # Initialize gripper position from actual robot state
+        gripper_current_position = robot_joint_angles[5] if len(robot_joint_angles) > 5 else robot_config.gripper_open_pos
+        
+        control_rate = RateLimiter(frequency=robot_config.control_frequency, warn=False)
+        control_loop_active = True
+        
+        # Initialize trajectory recording
+        trajectory = []
+        recording_start_time = None
+        
+        try:
+            while control_loop_active:
+                dt = control_rate.dt
+                
+                spacemouse.update()
+                
+                velocity_world = spacemouse.get_velocity_command()
+                angular_velocity_world = spacemouse.get_angular_velocity_command()
+                
+                # Update robot controller with velocity commands
+                robot_controller.update_from_velocity_command(
+                    velocity_world=velocity_world,
+                    angular_velocity_world=angular_velocity_world,
+                    dt=dt,
+                    configuration=configuration
+                )
+                
+                # Get joint commands from IK solution
+                joint_commands_rad = configuration.q[:5].copy()
+                
+                # Get gripper command from input source (SpaceMouse or future: neural network)
+                # This abstracts the input source - NN would output gripper directly, SpaceMouse uses buttons
+                gripper_target = spacemouse.get_gripper_command(gripper_current_position, dt)
+                gripper_current_position = gripper_target  # Update for next iteration
+                
+                # Record trajectory data (state and action)
+                if ENABLE_RECORDING:
+                    # Initialize recording start time on first sample
+                    if recording_start_time is None:
+                        recording_start_time = time.perf_counter()
+                    
+                    # State: joint positions from model (configuration.q)
+                    # 5 arm joints + gripper position
+                    state = np.concatenate([
+                        configuration.q[:5],  # 5 joint angles (radians)
+                        np.array([gripper_target])  # Gripper position (meters)
+                    ])
+                    
+                    # Action: velocity commands sent to IK + gripper command
+                    # delta xyz (linear velocity) + delta rpy (angular velocity) + gripper target
+                    action = np.concatenate([
+                        velocity_world,  # [vx, vy, vz] in m/s
+                        angular_velocity_world,  # [wx, wy, wz] in rad/s
+                        np.array([gripper_target])  # Gripper target position (meters)
+                    ])
+                    
+                    # Timestamp relative to recording start (t=0)
+                    timestamp = time.perf_counter() - recording_start_time
+                    
+                    trajectory.append({
+                        'timestamp': timestamp,
+                        'state': state.copy(),
+                        'action': action.copy()
+                    })
+                
+                # Convert joint commands to motor positions
+                motor_positions = translator.joint_commands_to_motor_positions(
+                    joint_angles_rad=joint_commands_rad,
+                    gripper_position=gripper_target
+                )
+                
+                # Send commands to robot
+                robot_driver.send_motor_positions(motor_positions, velocity_limit=robot_config.velocity_limit)
+                
+                control_rate.sleep()
+                
+        except KeyboardInterrupt:
+            print("\nKeyboard interrupt detected. Stopping control loop...")
+            control_loop_active = False
+        finally:
+            # Save trajectory if recording was enabled
+            if ENABLE_RECORDING and trajectory:
+                save_trajectory(trajectory, output_path)
+            
+            spacemouse.stop()
+            shutdown_sequence(robot_driver, velocity_limit=robot_config.velocity_limit)
+            
+            # Reboot motors after shutdown
+            reboot_motors(robot_driver)
+            robot_driver.disconnect()
+    
+    except Exception as e:
+        print(f"\n⚠️  Error: {e}")
+        print("Executing emergency shutdown...")
+        try:
+            shutdown_sequence(robot_driver, velocity_limit=robot_config.velocity_limit)
+        except:
+            pass
+        try:
+            robot_driver.disconnect()
+        except:
+            pass
+        raise
+
+
+if __name__ == "__main__":
+    main()
