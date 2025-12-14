@@ -12,8 +12,9 @@ from datetime import datetime
 from scipy.spatial.transform import Rotation as R
 
 from robot_control.robot_config import robot_config
-from robot_control.robot_control_base import RobotControlBase
+from robot_control.robot_control_base import RobotControlBase, get_sim_home_pose
 from robot_control.robot_startup import get_home_motor_positions
+from robot_control.robot_joint_to_motor import sync_robot_to_mujoco
 from spacemouse.spacemouse_driver import SpaceMouseDriver
 from utils.robot_control_gui import SimpleControlGUI
 
@@ -35,12 +36,23 @@ def save_trajectory(trajectory, output_path):
     # EE pose trajectory (debug data, not used by policy)
     ee_poses_debug = np.array([t['ee_pose_debug'] for t in trajectory])
     
+    # Check for additional fields (e.g., object_pose)
+    extra_arrays = {}
+    if trajectory:
+        for key in trajectory[0].keys():
+            if key not in ['timestamp', 'state', 'action', 'ee_pose_debug']:
+                try:
+                    extra_arrays[key] = np.array([t[key] for t in trajectory])
+                except Exception as e:
+                    print(f"Warning: Could not convert '{key}' to array: {e}")
+
     np.savez_compressed(
         output_path,
         timestamps=timestamps,
         states=states,
         actions=actions,
         ee_poses_debug=ee_poses_debug,  # Debug data for inspection
+        **extra_arrays,
         metadata={
             'num_samples': len(trajectory),
             'control_frequency': robot_config.control_frequency,
@@ -52,6 +64,7 @@ def save_trajectory(trajectory, output_path):
             'action_labels': ['vx', 'vy', 'vz', 'wx', 'wy', 'wz', 'gripper_target'],
             'ee_pose_debug_labels': ['ee_x', 'ee_y', 'ee_z', 'ee_qw', 'ee_qx', 'ee_qy', 'ee_qz'],
             'ee_pose_debug_note': 'End-effector pose trajectory for debugging/inspection only, NOT used by policy',
+            'extra_fields': list(extra_arrays.keys()),
             'timestamp': datetime.now().isoformat()
         }
     )
@@ -69,15 +82,15 @@ class TeleopControl(RobotControlBase):
     
     def __init__(self, enable_recording=False, output_path=None):
         super().__init__()
-        self.enable_recording = enable_recording  # Whether recording is enabled (can be toggled)
-        self.is_recording = False  # Whether currently recording (starts False, toggled by GUI)
+        self.enable_recording = enable_recording
+        self.is_recording = False
         self.output_path = output_path
         self.spacemouse = None
         self.trajectory = []
         self.recording_start_time = None
         self.control_gui = None
         self.home_motor_positions = None
-        self.trajectory_counter = 0  # Counter for multiple trajectory saves
+        self.trajectory_counter = 0
     
     def on_ready(self):
         """Setup SpaceMouse, GUI, and print ready message."""
@@ -103,11 +116,8 @@ class TeleopControl(RobotControlBase):
         
         if self.control_gui.is_available():
             print("✓ Control GUI opened")
-        else:
-            print("⚠️  GUI not available, using keyboard input only")
         
         # Get home motor positions
-        from robot_control.robot_control_base import get_sim_home_pose
         home_qpos, _, _ = get_sim_home_pose(self.model)
         self.home_motor_positions = get_home_motor_positions(self.translator, home_qpos=home_qpos)
     
@@ -124,26 +134,35 @@ class TeleopControl(RobotControlBase):
         """Get current end-effector pose from MuJoCo (for debugging/inspection only)."""
         # Sync MuJoCo data with current configuration
         self.data.qpos[:5] = self.configuration.q[:5]
-        if len(self.data.qpos) > 5:
-            self.data.qpos[5] = self.configuration.q[5] if len(self.configuration.q) > 5 else 0.0
+        if len(self.data.qpos) > 5 and len(self.configuration.q) > 5:
+            self.data.qpos[5] = self.configuration.q[5]
         
-        # Update forward kinematics
         mujoco.mj_forward(self.model, self.data)
         
         # Get site pose
         site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
-        ee_position = self.data.site(site_id).xpos.copy()
-        ee_xmat = self.data.site(site_id).xmat.reshape(3, 3)
-        ee_rot = R.from_matrix(ee_xmat)
-        ee_quat = ee_rot.as_quat()
-        ee_orientation_quat_wxyz = np.array([
-            ee_quat[3],  # w
-            ee_quat[0],  # x
-            ee_quat[1],  # y
-            ee_quat[2]   # z
-        ])
+        site = self.data.site(site_id)
+        ee_position = site.xpos.copy()
+        ee_xmat = site.xmat.reshape(3, 3)
+        ee_quat = R.from_matrix(ee_xmat).as_quat()
         
-        return ee_position, ee_orientation_quat_wxyz
+        # Convert from [x, y, z, w] to [w, x, y, z]
+        return ee_position, np.array([ee_quat[3], ee_quat[0], ee_quat[1], ee_quat[2]])
+    
+    def _generate_save_path(self):
+        """Generate save path for trajectory with counter suffix."""
+        if self.output_path:
+            base_path = Path(self.output_path)
+            if self.trajectory_counter == 0:
+                return base_path
+            return base_path.parent / f"{base_path.stem}_{self.trajectory_counter}{base_path.suffix}"
+        else:
+            data_dir = Path("data")
+            data_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if self.trajectory_counter == 0:
+                return data_dir / f"trajectory_{timestamp}.npz"
+            return data_dir / f"trajectory_{timestamp}_{self.trajectory_counter}.npz"
     
     def _handle_control_input(self):
         """Handle control commands from GUI."""
@@ -151,11 +170,7 @@ class TeleopControl(RobotControlBase):
             return
         
         command = self.control_gui.get_command()
-        if command is None:
-            return
-        
-        # Process only valid commands
-        if command not in ['h', 'r', 's']:
+        if command is None or command not in ['h', 'r', 's']:
             return
         
         try:
@@ -179,21 +194,17 @@ class TeleopControl(RobotControlBase):
                 
                 while time.perf_counter() - start_time < movement_duration:
                     # Check for new commands during movement
-                    if self.control_gui:
-                        new_cmd = self.control_gui.get_command()
-                        if new_cmd and new_cmd in ['h', 'r', 's']:
-                            # Queue command for next iteration
-                            if self.control_gui.is_available():
-                                with self.control_gui.lock:
-                                    self.control_gui.command_queue.insert(0, new_cmd)
-                            print("(Movement interrupted by new command)", flush=True)
-                            break
+                    new_cmd = self.control_gui.get_command() if self.control_gui else None
+                    if new_cmd in ['h', 'r', 's']:
+                        with self.control_gui.lock:
+                            self.control_gui.command_queue.insert(0, new_cmd)
+                        print("(Movement interrupted by new command)", flush=True)
+                        break
                     time.sleep(check_interval)
                 
                 # Sync MuJoCo to actual robot position after moving
                 time.sleep(0.1)
                 robot_encoders = self.robot_driver.read_all_encoders(max_retries=5, retry_delay=0.2)
-                from robot_control.robot_joint_to_motor import sync_robot_to_mujoco
                 robot_joint_angles, actual_position, actual_orientation_quat_wxyz = sync_robot_to_mujoco(
                     robot_encoders, self.translator, self.model, self.data, self.configuration
                 )
@@ -284,61 +295,30 @@ class TeleopControl(RobotControlBase):
             if self.recording_start_time is None:
                 self.recording_start_time = time.perf_counter()
             
-            # State: joint positions from model (used for policy observations)
-            state = np.concatenate([
-                self.configuration.q[:5],  # 5 joint angles (radians)
-                np.array([gripper_target])  # Gripper position (meters)
-            ])
-            
-            # Action: velocity commands + gripper target (used for policy actions)
-            action = np.concatenate([
-                velocity_world,  # [vx, vy, vz] in m/s
-                angular_velocity_world,  # [wx, wy, wz] in rad/s
-                np.array([gripper_target])  # Gripper target position (meters)
-            ])
-            
-            # EE pose: position + orientation (for debugging/inspection only, NOT used by policy)
+            # Record state, action, and EE pose
+            state = np.concatenate([self.configuration.q[:5], [gripper_target]])
+            action = np.concatenate([velocity_world, angular_velocity_world, [gripper_target]])
             ee_position, ee_orientation_quat_wxyz = self._get_current_ee_pose()
-            ee_pose_debug = np.concatenate([
-                ee_position,  # [x, y, z] in meters
-                ee_orientation_quat_wxyz  # [w, x, y, z] quaternion
-            ])
+            ee_pose_debug = np.concatenate([ee_position, ee_orientation_quat_wxyz])
             
-            timestamp = time.perf_counter() - self.recording_start_time
             self.trajectory.append({
-                'timestamp': timestamp,
+                'timestamp': time.perf_counter() - self.recording_start_time,
                 'state': state.copy(),
                 'action': action.copy(),
-                'ee_pose_debug': ee_pose_debug.copy()  # Debug data, not used by policy
+                'ee_pose_debug': ee_pose_debug.copy()
             })
     
     def run_control_loop(self):
-        """Override to save trajectory and stop SpaceMouse/keyboard on exit."""
+        """Override to save trajectory and stop GUI/SpaceMouse on exit."""
         try:
             super().run_control_loop()
         finally:
             # Save trajectory if recording was active and not already saved
             if self.is_recording and self.trajectory:
-                # Generate filename for final save
-                if self.output_path:
-                    base_path = Path(self.output_path)
-                    if self.trajectory_counter == 0:
-                        save_path = base_path
-                    else:
-                        save_path = base_path.parent / f"{base_path.stem}_{self.trajectory_counter}{base_path.suffix}"
-                else:
-                    data_dir = Path("data")
-                    data_dir.mkdir(exist_ok=True)
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    if self.trajectory_counter == 0:
-                        save_path = data_dir / f"trajectory_{timestamp}.npz"
-                    else:
-                        save_path = data_dir / f"trajectory_{timestamp}_{self.trajectory_counter}.npz"
-                
                 print("\n" + "="*60)
                 print("Saving final trajectory on exit...")
                 print("="*60)
-                save_trajectory(self.trajectory, save_path)
+                save_trajectory(self.trajectory, self._generate_save_path())
             
             # Stop GUI first (before SpaceMouse) to allow proper cleanup
             if self.control_gui:
@@ -348,8 +328,7 @@ class TeleopControl(RobotControlBase):
                 self.spacemouse.stop()
     
     def shutdown(self):
-        """Override to stop SpaceMouse and GUI before shutdown."""
-        # Stop GUI first to allow proper tkinter cleanup
+        """Override to stop GUI and SpaceMouse before shutdown."""
         if self.control_gui:
             self.control_gui.stop()
         if self.spacemouse:

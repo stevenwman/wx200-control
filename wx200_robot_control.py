@@ -22,7 +22,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
-from wx200_robot_teleop_control import TeleopControl, save_trajectory
+from wx200_robot_teleop_control import TeleopControl
 from wx200_robot_replay_trajectory import ReplayControl, load_trajectory
 
 
@@ -58,7 +58,6 @@ Examples:
     
     args = parser.parse_args()
     
-    # Determine mode and run
     if args.replay:
         # Replay mode
         trajectory_path = Path(args.replay)
@@ -74,25 +73,23 @@ Examples:
         trajectory = load_trajectory(trajectory_path)
         
         try:
-            replay = ReplayControl(trajectory, start_idx=args.start_index, end_idx=args.end_index)
-            replay.run()
+            ReplayControl(trajectory, start_idx=args.start_index, end_idx=args.end_index).run()
         except KeyboardInterrupt:
             print("\n\nKeyboard interrupt detected during initialization...")
         except Exception as e:
             print(f"Error: {e}")
             import traceback
             traceback.print_exc()
-    
     else:
         # Teleop mode (with optional recording)
         enable_recording = args.record
-        if enable_recording and args.output is None:
-            data_dir = Path("data")
-            data_dir.mkdir(exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = data_dir / f"trajectory_{timestamp}.npz"
-        elif enable_recording:
-            output_path = Path(args.output)
+        if enable_recording:
+            if args.output:
+                output_path = Path(args.output)
+            else:
+                data_dir = Path("data")
+                data_dir.mkdir(exist_ok=True)
+                output_path = data_dir / f"trajectory_{datetime.now().strftime('%Y%m%d_%H%M%S')}.npz"
         else:
             output_path = None
         
@@ -107,8 +104,7 @@ Examples:
             print(f"- Output file: {output_path}")
         print("="*60)
         
-        teleop = TeleopControl(enable_recording=enable_recording, output_path=output_path)
-        teleop.run()
+        TeleopControl(enable_recording=enable_recording, output_path=output_path).run()
 
 
 if __name__ == "__main__":
