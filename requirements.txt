@@ -6,3 +6,4 @@ scipy
 pyspacemouse
 dynamixel-sdk
 matplotlib
+opencv-python
