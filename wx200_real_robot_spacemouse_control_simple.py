@@ -19,12 +19,12 @@ from loop_rate_limiters import RateLimiter
 import mink
 import time
 import argparse
-from spacemouse_driver import SpaceMouseDriver
-from robot_controller import RobotController
-from robot_joint_to_motor import JointToMotorTranslator
-from robot_driver import RobotDriver
-from robot_shutdown import shutdown_sequence, reboot_motors
-from robot_config import robot_config
+from spacemouse.spacemouse_driver import SpaceMouseDriver
+from robot_control.robot_controller import RobotController
+from robot_control.robot_joint_to_motor import JointToMotorTranslator
+from robot_control.robot_driver import RobotDriver
+from robot_control.robot_shutdown import shutdown_sequence, reboot_motors
+from robot_control.robot_config import robot_config
 
 _HERE = Path(__file__).parent
 _XML = _HERE / "wx200" / "scene.xml"
@@ -82,8 +82,8 @@ def main():
     
     # Enable profiling if requested
     if ENABLE_PROFILING:
-        from control_frequency_profiler import ControlFrequencyProfiler
-        from robot_driver_profiling import create_profiled_driver
+        from utils.control_frequency_profiler import ControlFrequencyProfiler
+        from robot_control.robot_driver_profiling import create_profiled_driver
         profiler = ControlFrequencyProfiler(stats_interval=100)
         robot_driver = create_profiled_driver(robot_driver, stats_interval=100)
     else:

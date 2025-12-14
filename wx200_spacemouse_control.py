@@ -17,9 +17,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 from loop_rate_limiters import RateLimiter
 import mink
-from spacemouse_driver import SpaceMouseDriver
-from robot_controller import RobotController
-from robot_config import robot_config
+from spacemouse.spacemouse_driver import SpaceMouseDriver
+from robot_control.robot_controller import RobotController
+from robot_control.robot_config import robot_config
 
 _HERE = Path(__file__).parent
 _XML = _HERE / "wx200" / "scene.xml"

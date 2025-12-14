@@ -12,8 +12,8 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 from loop_rate_limiters import RateLimiter
-from robot_joint_to_motor import JointToMotorTranslator, encoder_to_joint_angle, ENCODER_CENTER, ENCODER_MAX
-from robot_driver import RobotDriver
+from robot_control.robot_joint_to_motor import JointToMotorTranslator, encoder_to_joint_angle, ENCODER_CENTER, ENCODER_MAX
+from robot_control.robot_driver import RobotDriver
 from dynamixel_sdk import *
 
 _HERE = Path(__file__).parent
