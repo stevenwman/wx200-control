@@ -41,11 +41,23 @@ class PoseFilter:
         Returns:
             (filtered_rvec, filtered_tvec): Filtered pose
         """
+        # Ensure proper shape
+        rvec = rvec.reshape(3, 1) if rvec.shape != (3, 1) else rvec
+        tvec = tvec.reshape(3, 1) if tvec.shape != (3, 1) else tvec
+        
         if self.last_rvec is None:
             # First frame - initialize
+            # Validate initial pose
+            if np.any(np.isnan(rvec)) or np.any(np.isnan(tvec)) or \
+               np.any(np.isinf(rvec)) or np.any(np.isinf(tvec)):
+                return None, None  # Invalid initial pose
+            
+            R, _ = cv2.Rodrigues(rvec)
+            if R is None or np.any(np.isnan(R)) or np.any(np.isinf(R)):
+                return None, None  # Invalid rotation matrix
+            
             self.last_rvec = rvec.copy()
             self.last_tvec = tvec.copy()
-            R, _ = cv2.Rodrigues(rvec)
             self.last_rmat = R
             self.last_z_axis = R[:, 2]
             return rvec, tvec
@@ -91,6 +103,12 @@ class PoseFilter:
         # Exponential smoothing
         filtered_rvec = self.alpha * rvec + (1 - self.alpha) * self.last_rvec
         filtered_tvec = self.alpha * tvec + (1 - self.alpha) * self.last_tvec
+        
+        # Validate filtered pose - check for NaN/Inf
+        if np.any(np.isnan(filtered_rvec)) or np.any(np.isnan(filtered_tvec)) or \
+           np.any(np.isinf(filtered_rvec)) or np.any(np.isinf(filtered_tvec)):
+            # Filter produced invalid values, return last known good pose
+            return self.last_rvec.copy(), self.last_tvec.copy()
         
         # Update state
         self.last_rvec = filtered_rvec.copy()
