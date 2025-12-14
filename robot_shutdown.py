@@ -150,16 +150,29 @@ def shutdown_sequence(robot_driver, velocity_limit=30):
             if comm_result == COMM_SUCCESS and dxl_error != 0:
                 print(f"  [ID {dxl_id}] Packet Error: {packetHandler.getRxPacketError(dxl_error)}", flush=True)
     
+    # Ensure gripper is open during shutdown (motor 7 = last motor)
+    reasonable_pose = list(robot_config.reasonable_home_pose)
+    base_pose = list(robot_config.base_home_pose)
+    folded_pose = list(robot_config.folded_home_pose)
+    
+    # Set gripper (motor 7, index 6) to open position
+    if len(reasonable_pose) > 6:
+        reasonable_pose[6] = robot_config.gripper_encoder_max  # Open
+    if len(base_pose) > 6:
+        base_pose[6] = robot_config.gripper_encoder_max  # Open
+    if len(folded_pose) > 6:
+        folded_pose[6] = robot_config.gripper_encoder_max  # Open
+    
     print("\nStep 1: Reasonable Home")
-    move_to_pose(robot_config.motor_ids, robot_config.reasonable_home_pose, velocity_limit)
+    move_to_pose(robot_config.motor_ids, reasonable_pose, velocity_limit)
     time.sleep(robot_config.move_delay)
     
     print("\nStep 2: Aligning Base")
-    move_to_pose(robot_config.motor_ids, robot_config.base_home_pose, velocity_limit)
+    move_to_pose(robot_config.motor_ids, base_pose, velocity_limit)
     time.sleep(robot_config.move_delay)
     
     print("\nStep 3: Folding to Rest")
-    move_to_pose(robot_config.motor_ids, robot_config.folded_home_pose, velocity_limit)
+    move_to_pose(robot_config.motor_ids, folded_pose, velocity_limit)
     time.sleep(robot_config.move_delay)
     
     print("\nStep 4: Disabling Torque")

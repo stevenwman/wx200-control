@@ -5,6 +5,11 @@ Flow:
 1. Startup: Move robot to sim keyframe home position
 2. Main loop: Read SpaceMouse → Update pose controller → Solve IK → Send to robot
 3. Shutdown: Execute safe exit sequence
+
+Usage:
+    python wx200_real_robot_spacemouse_control_simple.py [--profile]
+    
+    --profile: Enable control frequency profiling
 """
 from pathlib import Path
 import mujoco
@@ -13,13 +18,13 @@ from scipy.spatial.transform import Rotation as R
 from loop_rate_limiters import RateLimiter
 import mink
 import time
+import argparse
 from spacemouse_driver import SpaceMouseDriver
 from robot_controller import RobotController
 from robot_joint_to_motor import JointToMotorTranslator
 from robot_driver import RobotDriver
 from robot_shutdown import shutdown_sequence, reboot_motors
 from robot_config import robot_config
-from dynamixel_sdk import COMM_SUCCESS
 
 _HERE = Path(__file__).parent
 _XML = _HERE / "wx200" / "scene.xml"
@@ -49,11 +54,21 @@ def get_sim_home_pose(model):
 
 
 def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='WX200 Real Robot Control with SpaceMouse')
+    parser.add_argument('--profile', action='store_true',
+                       help='Enable control frequency profiling')
+    args = parser.parse_args()
+    
+    ENABLE_PROFILING = args.profile
+    
     print("WX200 Real Robot Control with SpaceMouse")
     print("="*60)
     print("Features:")
     print("- SpaceMouse control")
     print("- Safe startup and shutdown sequences")
+    if ENABLE_PROFILING:
+        print("- Control frequency profiling enabled")
     print("="*60)
     
     model = mujoco.MjModel.from_xml_path(_XML.as_posix())
@@ -64,6 +79,15 @@ def main():
     print(f"\nSim home pose - EE position: {home_position}")
     
     robot_driver = RobotDriver()
+    
+    # Enable profiling if requested
+    if ENABLE_PROFILING:
+        from control_frequency_profiler import ControlFrequencyProfiler
+        from robot_driver_profiling import create_profiled_driver
+        profiler = ControlFrequencyProfiler(stats_interval=100)
+        robot_driver = create_profiled_driver(robot_driver, stats_interval=100)
+    else:
+        profiler = None
     
     try:
         print("\nConnecting to robot...")
@@ -121,10 +145,17 @@ def main():
             posture_cost=1e-2
         )
         
+        # Override gripper position in home_qpos to be open (not closed from keyframe)
+        if len(home_qpos) > 5:
+            home_qpos[5] = robot_config.gripper_open_pos
+        
         configuration.update(home_qpos)
         robot_controller.initialize_posture_target(configuration)
         
         mujoco.mj_resetDataKeyframe(model, data, model.key("home").id)
+        # Override gripper position in data.qpos to be open
+        if len(data.qpos) > 5:
+            data.qpos[5] = robot_config.gripper_open_pos
         configuration.update(data.qpos)
         mujoco.mj_forward(model, data)
         
@@ -132,20 +163,45 @@ def main():
         control_loop_active = True
         gripper_current_position = robot_config.gripper_open_pos
         
+        # Start profiling if enabled
+        if profiler:
+            profiler.start()
+        
         try:
             while control_loop_active:
+                if profiler:
+                    profiler.before_loop()
+                
                 dt = control_rate.dt
                 
-                spacemouse.update()
+                # Profile SpaceMouse update if profiling
+                if profiler:
+                    t0 = time.perf_counter()
+                    spacemouse.update()
+                    profiler.record_pipeline_step('spacemouse_update', time.perf_counter() - t0)
+                else:
+                    spacemouse.update()
+                
                 velocity_world = spacemouse.get_velocity_command()
                 angular_velocity_world = spacemouse.get_angular_velocity_command()
                 
-                robot_controller.update_from_velocity_command(
-                    velocity_world=velocity_world,
-                    angular_velocity_world=angular_velocity_world,
-                    dt=dt,
-                    configuration=configuration
-                )
+                # Profile IK solve if profiling
+                if profiler:
+                    t0 = time.perf_counter()
+                    robot_controller.update_from_velocity_command(
+                        velocity_world=velocity_world,
+                        angular_velocity_world=angular_velocity_world,
+                        dt=dt,
+                        configuration=configuration
+                    )
+                    profiler.record_pipeline_step('ik_solve', time.perf_counter() - t0)
+                else:
+                    robot_controller.update_from_velocity_command(
+                        velocity_world=velocity_world,
+                        angular_velocity_world=angular_velocity_world,
+                        dt=dt,
+                        configuration=configuration
+                    )
                 
                 joint_commands_rad = configuration.q[:5]
                 
@@ -161,12 +217,31 @@ def main():
                 
                 gripper_target = gripper_current_position
                 
-                motor_positions = translator.joint_commands_to_motor_positions(
-                    joint_angles_rad=joint_commands_rad,
-                    gripper_position=gripper_target
-                )
+                # Profile joint-to-motor conversion if profiling
+                if profiler:
+                    t0 = time.perf_counter()
+                    motor_positions = translator.joint_commands_to_motor_positions(
+                        joint_angles_rad=joint_commands_rad,
+                        gripper_position=gripper_target
+                    )
+                    profiler.record_pipeline_step('joint_to_motor', time.perf_counter() - t0)
+                else:
+                    motor_positions = translator.joint_commands_to_motor_positions(
+                        joint_angles_rad=joint_commands_rad,
+                        gripper_position=gripper_target
+                    )
                 
-                robot_driver.send_motor_positions(motor_positions, velocity_limit=robot_config.velocity_limit)
+                # Profile command send if profiling
+                if profiler:
+                    profiler.before_send()
+                    robot_driver.send_motor_positions(motor_positions, velocity_limit=robot_config.velocity_limit)
+                    profiler.after_send()
+                else:
+                    robot_driver.send_motor_positions(motor_positions, velocity_limit=robot_config.velocity_limit)
+                
+                if profiler:
+                    profiler.after_loop()
+                
                 control_rate.sleep()
         
         except KeyboardInterrupt:
@@ -175,6 +250,10 @@ def main():
         finally:
             control_loop_active = False
             time.sleep(0.3)
+            
+            # Stop profiling and print final stats if enabled
+            if profiler:
+                profiler.stop()
             
             # Execute shutdown sequence (homing motors) before stopping SpaceMouse
             # This is safe because motor commands don't interfere with SpaceMouse

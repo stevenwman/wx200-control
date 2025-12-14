@@ -26,6 +26,8 @@ class RobotDriver:
         self.connected = False
         # Cache velocity limit to avoid setting it every loop
         self._last_velocity_limit = None
+        # GroupSyncWrite for efficient bulk position writes
+        self.groupSyncWrite = None
     
     def reboot_all_motors(self):
         """
@@ -89,15 +91,33 @@ class RobotDriver:
             elif dxl_error != 0:
                 raise RuntimeError(f"Motor {dxl_id} error: {self.packetHandler.getRxPacketError(dxl_error)}")
         
+        # Initialize GroupSyncWrite for bulk position writes (much faster than individual writes)
+        self.groupSyncWrite = GroupSyncWrite(
+            self.portHandler, 
+            self.packetHandler, 
+            robot_config.addr_goal_position, 
+            4  # 4 bytes for goal position
+        )
+        
         self.connected = True
         print(f"Robot driver connected on {self.devicename}")
     
     def disconnect(self):
         """Disconnect from robot and disable torque."""
         if self.connected:
-            self.disable_torque_all()
+            # Only disable torque if port is still open (shutdown sequence may have closed it)
+            # Use try-except since shutdown sequence may have already closed the port
+            try:
+                self.disable_torque_all()
+            except Exception:
+                pass  # Port may already be closed, ignore error
+            
             if self.portHandler:
-                self.portHandler.closePort()
+                try:
+                    self.portHandler.closePort()
+                except Exception:
+                    pass  # Port may already be closed, ignore error
+            
             self.connected = False
             print("Robot driver disconnected")
     
@@ -106,27 +126,42 @@ class RobotDriver:
         if not self.connected:
             return
         
+        # Check if port handler exists
+        if not self.portHandler:
+            return
+        
         print("Disabling torque on all motors...")
         for dxl_id in robot_config.motor_ids:
-            self.packetHandler.write1ByteTxRx(
-                self.portHandler, dxl_id, robot_config.addr_torque_enable, 0
-            )
+            try:
+                self.packetHandler.write1ByteTxRx(
+                    self.portHandler, dxl_id, robot_config.addr_torque_enable, 0
+                )
+            except Exception:
+                pass  # Ignore errors if port is closed or motor unreachable
         print("Torque disabled")
     
-    def set_profile_velocity(self, motor_id, velocity_limit):
+    def set_profile_velocity(self, motor_id, velocity_limit, use_tx_only=False):
         """
         Set profile velocity (speed limit) for a motor.
         
         Args:
             motor_id: Motor ID
             velocity_limit: Speed limit (0=Max, higher=slower)
+            use_tx_only: If True, use TxOnly (non-blocking) instead of TxRx (blocking)
         """
         if not self.connected:
             raise RuntimeError("Not connected to robot")
         
-        self.packetHandler.write4ByteTxRx(
-            self.portHandler, motor_id, robot_config.addr_profile_velocity, velocity_limit
-        )
+        if use_tx_only:
+            # Use TxOnly for low latency (no response wait)
+            self.packetHandler.write4ByteTxOnly(
+                self.portHandler, motor_id, robot_config.addr_profile_velocity, velocity_limit
+            )
+        else:
+            # Use TxRx (blocking, waits for response) - slower but confirms write
+            self.packetHandler.write4ByteTxRx(
+                self.portHandler, motor_id, robot_config.addr_profile_velocity, velocity_limit
+            )
     
     def set_profile_velocity_all(self, velocity_limit):
         """Set profile velocity for all motors."""
@@ -137,6 +172,10 @@ class RobotDriver:
         """
         Send motor position commands (optimized for low latency).
         
+        Uses GroupSyncWrite to send all motor positions in a single packet for maximum speed.
+        This is the production implementation - robot_driver_profiling.py wraps this
+        with identical control logic plus timing measurements.
+        
         Args:
             motor_positions: dict {motor_id: encoder_position}
             velocity_limit: Speed limit for movement (0=Max, 30=Slow/Safe)
@@ -145,24 +184,48 @@ class RobotDriver:
             raise RuntimeError("Not connected to robot")
         
         # Only set velocity limit if it changed (optimization)
+        # Use TxOnly for velocity setting too - we don't need to wait for confirmation
+        # This significantly reduces latency (TxRx is ~15ms per motor, TxOnly is ~1-2ms)
         if velocity_limit != self._last_velocity_limit:
             for motor_id in motor_positions.keys():
-                self.set_profile_velocity(motor_id, velocity_limit)
+                self.set_profile_velocity(motor_id, velocity_limit, use_tx_only=True)
             self._last_velocity_limit = velocity_limit
         
-        # Send position commands using TxOnly (no response wait) for low latency
-        # TxOnly is fire-and-forget: ~1-2ms per motor vs ~15ms for TxRx
-        # Trade-off: faster control loop but no error checking in hot path
+        # Send position commands using GroupSyncWrite (bulk write - much faster!)
+        # This sends all motor positions in a single packet instead of 7 separate packets
+        # Should reduce send time from ~20ms to ~2-5ms
+        self.groupSyncWrite.clearParam()
+        
         for motor_id, goal_pos in motor_positions.items():
             if motor_id not in robot_config.motor_ids:
                 continue  # Skip invalid IDs silently in hot loop
             
-            self.packetHandler.write4ByteTxOnly(
-                self.portHandler, motor_id, robot_config.addr_goal_position, goal_pos
-            )
+            # Convert 32-bit position to 4-byte array (little-endian)
+            param_goal_position = [
+                DXL_LOBYTE(DXL_LOWORD(goal_pos)),
+                DXL_HIBYTE(DXL_LOWORD(goal_pos)),
+                DXL_LOBYTE(DXL_HIWORD(goal_pos)),
+                DXL_HIBYTE(DXL_HIWORD(goal_pos))
+            ]
+            
+            # Add parameter to sync write group
+            dxl_addparam_result = self.groupSyncWrite.addParam(motor_id, param_goal_position)
+            if not dxl_addparam_result:
+                # If addParam fails, fall back to individual write
+                self.packetHandler.write4ByteTxOnly(
+                    self.portHandler, motor_id, robot_config.addr_goal_position, goal_pos
+                )
         
-        # Note: We don't call clearPort() here as it can cause port conflicts.
-        # The port state will be flushed when transitioning to TxRx mode (e.g., shutdown).
+        # Transmit all positions in a single packet
+        dxl_comm_result = self.groupSyncWrite.txPacket()
+        if dxl_comm_result != COMM_SUCCESS:
+            # If sync write fails, fall back to individual writes
+            for motor_id, goal_pos in motor_positions.items():
+                if motor_id not in robot_config.motor_ids:
+                    continue
+                self.packetHandler.write4ByteTxOnly(
+                    self.portHandler, motor_id, robot_config.addr_goal_position, goal_pos
+                )
     
     def read_present_current(self, motor_id):
         """

@@ -6,6 +6,8 @@ can work with both simulation and real robot hardware.
 """
 import numpy as np
 import mink
+import mujoco
+from scipy.spatial.transform import Rotation as R
 from ee_pose_controller import EndEffectorPoseController
 from robot_config import robot_config
 
@@ -57,6 +59,9 @@ class RobotController:
         self.pos_threshold = robot_config.ik_pos_threshold
         self.ori_threshold = robot_config.ik_ori_threshold
         self.max_iters = robot_config.ik_max_iters
+        
+        # Track previous velocity state to detect zero-velocity transitions
+        self._prev_velocity_active = False
     
     def initialize_posture_target(self, configuration):
         """
@@ -69,9 +74,41 @@ class RobotController:
         self.posture_task.set_target_from_configuration(configuration)
         self._posture_target_initialized = True
     
+    def _get_current_pose_from_configuration(self, configuration):
+        """
+        Get current end-effector pose from configuration using MuJoCo forward kinematics.
+        
+        Args:
+            configuration: mink.Configuration
+            
+        Returns:
+            tuple: (position, orientation_quat_wxyz) where orientation is [w, x, y, z]
+        """
+        # Create temporary MuJoCo data to compute forward kinematics
+        data = mujoco.MjData(self.model)
+        data.qpos[:len(configuration.q)] = configuration.q
+        
+        # Forward kinematics
+        mujoco.mj_forward(self.model, data)
+        
+        # Get site transform
+        site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, self.end_effector_task.frame_name)
+        current_position = data.site(site_id).xpos.copy()
+        current_xmat = data.site(site_id).xmat.reshape(3, 3)
+        
+        # Convert rotation matrix to quaternion [w, x, y, z]
+        current_rot = R.from_matrix(current_xmat)
+        quat_xyzw = current_rot.as_quat()  # [x, y, z, w]
+        orientation_quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+        
+        return current_position, orientation_quat_wxyz
+    
     def update_from_velocity_command(self, velocity_world, angular_velocity_world, dt, configuration):
         """
         Update controller with velocity commands and solve IK.
+        
+        When velocity is zero (user released input), reset target to current pose
+        to prevent continued motion after release. This provides smooth, responsive control.
         
         Args:
             velocity_world: [vx, vy, vz] linear velocity in world frame (m/s)
@@ -86,12 +123,30 @@ class RobotController:
         if not self._posture_target_initialized:
             self.initialize_posture_target(configuration)
         
-        # Update pose controller with velocity commands
-        self.pose_controller.update_from_velocity_command(
-            velocity_world=velocity_world,
-            angular_velocity_world=angular_velocity_world,
-            dt=dt
-        )
+        # Check if velocity is zero (user released input)
+        # Only reset target when transitioning from active to zero (one-time reset)
+        # This prevents drift while still stopping motion after release
+        vel_magnitude = np.linalg.norm(velocity_world)
+        omega_magnitude = np.linalg.norm(angular_velocity_world)
+        velocity_threshold = 1e-4  # Small threshold to account for noise
+        velocity_active = (vel_magnitude >= velocity_threshold) or (omega_magnitude >= velocity_threshold)
+        
+        # Detect transition from active to zero (user just released)
+        if not velocity_active and self._prev_velocity_active:
+            # User just released input: reset target to current actual pose (one-time)
+            current_position, current_orientation = self._get_current_pose_from_configuration(configuration)
+            self.pose_controller.reset_pose(current_position, current_orientation)
+        elif velocity_active:
+            # User is providing input: integrate velocity to update target
+            self.pose_controller.update_from_velocity_command(
+                velocity_world=velocity_world,
+                angular_velocity_world=angular_velocity_world,
+                dt=dt
+            )
+        # If velocity is zero and was already zero, do nothing (target stays where it is)
+        
+        # Update previous state
+        self._prev_velocity_active = velocity_active
         
         # Get target pose and set for IK
         target_pose = self.pose_controller.get_target_pose_se3()
