@@ -156,8 +156,11 @@ class TeleopCameraControl(TeleopControl):
                         if r_ee is not None:
                             cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_ee, t_ee, AXIS_LENGTH)
                     
-                    # Resize for display
-                    disp = cv2.resize(frame, (640, 360))
+                    # Resize for display (configurable preview size)
+                    disp = cv2.resize(
+                        frame,
+                        (robot_config.camera_width // 2, robot_config.camera_height // 2)
+                    )
                     cv2.imshow('Robot Camera View', disp)
                     cv2.waitKey(1)
 

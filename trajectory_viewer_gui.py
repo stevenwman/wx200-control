@@ -86,6 +86,12 @@ def load_trajectory(npz_path: Path):
         "aruco_visibility",
     ]
     aruco_data = {k: data[k] for k in aruco_keys if k in data}
+    
+    # Also load smoothed versions if available
+    smoothed_keys = [f"smoothed_{k}" for k in aruco_keys if k != "aruco_visibility"]
+    for k in smoothed_keys:
+        if k in data:
+            aruco_data[k] = data[k]
 
     return dict(
         timestamps=timestamps,
@@ -157,6 +163,144 @@ def make_3d_figure(traj, title_suffix: str):
             aspectmode="data",
         ),
         height=600,
+        margin=dict(l=0, r=0, b=0, t=40),
+        legend=dict(itemsizing="constant"),
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+    )
+    return fig
+
+
+def _draw_rgb_axes(fig, pos, quat_wxyz, axis_length=0.008, name_prefix="", opacity=0.6, showlegend=False):
+    """Draw RGB coordinate axes (X=red, Y=green, Z=blue) at a pose."""
+    quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]])
+    rot = R.from_quat(quat_xyzw)
+    R_matrix = rot.as_matrix()
+    
+    axes_local = np.array([[axis_length, 0, 0], [0, axis_length, 0], [0, 0, axis_length]])
+    axes_world = (R_matrix @ axes_local.T).T + pos
+    
+    colors = ['red', 'green', 'blue']
+    labels = ['X', 'Y', 'Z']
+    
+    for i in range(3):
+        fig.add_trace(go.Scatter3d(
+            x=[pos[0], axes_world[i, 0]],
+            y=[pos[1], axes_world[i, 1]],
+            z=[pos[2], axes_world[i, 2]],
+            mode='lines',
+            name=f'{name_prefix} {labels[i]}',
+            line=dict(color=colors[i], width=6),  # Much thicker frame lines
+            showlegend=showlegend and (i == 0),
+            legendgroup=name_prefix,
+            opacity=opacity,
+        ))
+
+
+def make_smoothed_3d_figure(traj, title_suffix: str):
+    """3D plot of smoothed trajectories with green connectors and coordinate frames at every step."""
+    timestamps = traj["timestamps"]
+    aruco = traj["aruco_data"]
+    
+    # Check for smoothed data
+    ee_smooth_key = "smoothed_aruco_ee_in_world"
+    obj_smooth_key = "smoothed_aruco_object_in_world"
+    
+    if ee_smooth_key not in aruco or obj_smooth_key not in aruco:
+        fig = go.Figure()
+        fig.add_annotation(
+            x=0.5, y=0.5,
+            xref="paper", yref="paper",
+            text="Smoothed trajectory data not available.<br>Run: python smooth_aruco_trajectory.py [trajectory_file.npz]",
+            showarrow=False,
+            font=dict(size=14, color="#CCCCCC"),
+        )
+        fig.update_layout(
+            title=f"Smoothed Trajectory – {title_suffix}",
+            template="plotly_dark",
+            paper_bgcolor=DARK_BG,
+            height=400,
+        )
+        return fig
+    
+    ee_smooth = aruco[ee_smooth_key]
+    obj_smooth = aruco[obj_smooth_key]
+    
+    fig = go.Figure()
+    
+    # Smoothed trajectories with markers (thicker lines, bigger dots)
+    fig.add_trace(go.Scatter3d(
+        x=ee_smooth[:, 0], y=ee_smooth[:, 1], z=ee_smooth[:, 2],
+        mode="lines+markers", name="EE smoothed",
+        line=dict(color="blue", width=5), 
+        marker=dict(size=4, color="blue", opacity=0.8),
+        opacity=0.7,
+    ))
+    fig.add_trace(go.Scatter3d(
+        x=obj_smooth[:, 0], y=obj_smooth[:, 1], z=obj_smooth[:, 2],
+        mode="lines+markers", name="Object smoothed",
+        line=dict(color="red", width=5),
+        marker=dict(size=4, color="red", opacity=0.8),
+        opacity=0.7,
+    ))
+    
+    # Yellow connectors at every timestep (thicker)
+    xs, ys, zs = [], [], []
+    for i in range(len(timestamps)):
+        if np.all(np.isfinite(ee_smooth[i, :3])) and np.all(np.isfinite(obj_smooth[i, :3])):
+            xs.extend([ee_smooth[i, 0], obj_smooth[i, 0], np.nan])
+            ys.extend([ee_smooth[i, 1], obj_smooth[i, 1], np.nan])
+            zs.extend([ee_smooth[i, 2], obj_smooth[i, 2], np.nan])
+    
+    if xs:
+        fig.add_trace(go.Scatter3d(
+            x=xs, y=ys, z=zs,
+            mode="lines", name="EE↔Object connectors",
+            line=dict(color="yellow", width=2), opacity=0.5,
+        ))
+    
+    # Coordinate frames at EVERY timestep
+    N = len(timestamps)
+    frame_indices = list(range(N))
+    
+    # Adjust opacity and size based on number of frames (smaller frames)
+    if N > 200:
+        axis_length = 0.004
+        opacity = 0.3
+    elif N > 100:
+        axis_length = 0.005
+        opacity = 0.4
+    else:
+        axis_length = 0.006
+        opacity = 0.5
+    
+    # Draw frames for EE at every step (smaller)
+    for idx in frame_indices:
+        if np.all(np.isfinite(ee_smooth[idx, :3])) and np.all(np.isfinite(ee_smooth[idx, 3:7])):
+            pos = ee_smooth[idx, :3]
+            quat = ee_smooth[idx, 3:7]
+            _draw_rgb_axes(fig, pos, quat, axis_length=axis_length, name_prefix=f"EE_{idx}", opacity=opacity, showlegend=(idx == 0))
+    
+    # Draw frames for Object at every step (smaller)
+    for idx in frame_indices:
+        if np.all(np.isfinite(obj_smooth[idx, :3])) and np.all(np.isfinite(obj_smooth[idx, 3:7])):
+            pos = obj_smooth[idx, :3]
+            quat = obj_smooth[idx, 3:7]
+            _draw_rgb_axes(fig, pos, quat, axis_length=axis_length, name_prefix=f"Obj_{idx}", opacity=opacity, showlegend=(idx == 0))
+    
+    fig.add_trace(go.Scatter3d(
+        x=[0], y=[0], z=[0],
+        mode="markers", name="World origin",
+        marker=dict(size=8, color="black", symbol="x"),
+    ))
+    
+    fig.update_layout(
+        title=f"Smoothed Trajectory with Frames (every step) – {title_suffix}",
+        scene=dict(
+            xaxis_title="X (m)", yaxis_title="Y (m)", zaxis_title="Z (m)",
+            aspectmode="data",
+        ),
+        height=700,
         margin=dict(l=0, r=0, b=0, t=40),
         legend=dict(itemsizing="constant"),
         template="plotly_dark",
@@ -397,7 +541,21 @@ def create_app() -> Dash:
             html.H2("Trajectory Viewer", style={"color": "#FFFFFF"}),
             html.Div(
                 [
-                    html.Label("Trajectory file:", style={"color": "#DDDDDD"}),
+                    html.Div(
+                        [
+                            html.Label("Trajectory file:", style={"color": "#DDDDDD"}),
+                            html.Span(
+                                f"({len(options)} valid)",
+                                id="traj-count",
+                                style={
+                                    "color": "#AAAAAA",
+                                    "fontSize": "0.85rem",
+                                    "marginLeft": "0.5rem",
+                                },
+                            ),
+                        ],
+                        style={"display": "flex", "alignItems": "center"},
+                    ),
                     dcc.Dropdown(
                         id="traj-file-dropdown",
                         options=options,
@@ -442,6 +600,8 @@ def create_app() -> Dash:
             dcc.Graph(id="traj-3d-graph"),
             html.H3("EE–Object Spatial Relationship (Connectors)"),
             dcc.Graph(id="traj-3d-connect-graph"),
+            html.H3("Smoothed Trajectory with Coordinate Frames"),
+            dcc.Graph(id="traj-smoothed-3d-graph"),
             html.H3("Marker Visibility Over Time"),
             dcc.Graph(id="traj-vis-graph"),
             html.H3("Actions Over Time"),
@@ -453,6 +613,7 @@ def create_app() -> Dash:
     @app.callback(
         Output("traj-file-dropdown", "options"),
         Output("traj-file-dropdown", "value"),
+        Output("traj-count", "children"),
         Input("traj-refresh-btn", "n_clicks"),
         Input("traj-quarantine-btn", "n_clicks"),
         State("traj-file-dropdown", "value"),
@@ -476,6 +637,7 @@ def create_app() -> Dash:
 
         new_options = file_options()
         new_values = [o["value"] for o in new_options]
+        count_text = f"({len(new_options)} valid)"
 
         # Keep current if still valid; else pick last available
         if current_value in new_values:
@@ -483,7 +645,7 @@ def create_app() -> Dash:
         else:
             new_value = new_values[-1] if new_values else None
 
-        return new_options, new_value
+        return new_options, new_value, count_text
 
     # Prev/Next navigation
     @app.callback(
@@ -514,6 +676,7 @@ def create_app() -> Dash:
         Output("traj-summary", "children"),
         Output("traj-3d-graph", "figure"),
         Output("traj-3d-connect-graph", "figure"),
+        Output("traj-smoothed-3d-graph", "figure"),
         Output("traj-vis-graph", "figure"),
         Output("traj-actions-graph", "figure"),
         Input("traj-file-dropdown", "value"),
@@ -521,7 +684,7 @@ def create_app() -> Dash:
     def update_plots(npz_path_str):
         if not npz_path_str:
             empty = go.Figure(layout={"title": "No trajectory selected"})
-            return "No trajectory selected.", empty, empty, empty, empty
+            return "No trajectory selected.", empty, empty, empty, empty, empty
 
         npz_path = Path(npz_path_str)
         try:
@@ -529,7 +692,7 @@ def create_app() -> Dash:
         except Exception as e:
             msg = f"Error loading {npz_path.name}: {e}"
             err = go.Figure(layout={"title": msg})
-            return msg, err, err, err
+            return msg, err, err, err, err, err
 
         ts = traj["timestamps"]
         metadata = traj["metadata"]
@@ -566,6 +729,7 @@ def create_app() -> Dash:
             summary,
             make_3d_figure(traj, suffix),
             make_3d_connections_figure(traj, suffix),
+            make_smoothed_3d_figure(traj, suffix),
             make_visibility_figure(traj, suffix),
             make_actions_figure(traj, suffix),
         )

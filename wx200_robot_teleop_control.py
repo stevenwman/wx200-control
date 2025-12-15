@@ -46,6 +46,32 @@ def save_trajectory(trajectory, output_path):
                 except Exception as e:
                     print(f"Warning: Could not convert '{key}' to array: {e}")
 
+    # Build base metadata
+    metadata = {
+        'num_samples': len(trajectory),
+        'control_frequency': robot_config.control_frequency,
+        'duration_seconds': timestamps[-1] if len(timestamps) > 0 else 0.0,
+        'state_dim': 6,  # 5 joints + gripper
+        'action_dim': 7,  # 3 linear + 3 angular velocities + gripper target
+        'ee_pose_debug_dim': 7,  # 3 position + 4 quaternion (wxyz)
+        'state_labels': ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'gripper'],
+        'action_labels': ['vx', 'vy', 'vz', 'wx', 'wy', 'wz', 'gripper_target'],
+        'ee_pose_debug_labels': ['ee_x', 'ee_y', 'ee_z', 'ee_qw', 'ee_qx', 'ee_qy', 'ee_qz'],
+        'ee_pose_debug_note': 'End-effector pose trajectory for debugging/inspection only, NOT used by policy',
+        'extra_fields': list(extra_arrays.keys()),
+        'timestamp': datetime.now().isoformat()
+    }
+
+    # If augmented_actions are present (from camera demo), add labels for them too
+    if 'augmented_actions' in extra_arrays:
+        metadata['augmented_action_dim'] = extra_arrays['augmented_actions'].shape[1]
+        metadata['augmented_action_labels'] = [
+            'vx', 'vy', 'vz',          # linear velocity
+            'wx', 'wy', 'wz',          # angular velocity
+            'axis_angle_x', 'axis_angle_y', 'axis_angle_z',  # per-step axis-angle vector
+            'gripper_target',          # gripper
+        ][: metadata['augmented_action_dim']]
+
     np.savez_compressed(
         output_path,
         timestamps=timestamps,
@@ -53,20 +79,7 @@ def save_trajectory(trajectory, output_path):
         actions=actions,
         ee_poses_debug=ee_poses_debug,  # Debug data for inspection
         **extra_arrays,
-        metadata={
-            'num_samples': len(trajectory),
-            'control_frequency': robot_config.control_frequency,
-            'duration_seconds': timestamps[-1] if len(timestamps) > 0 else 0.0,
-            'state_dim': 6,  # 5 joints + gripper
-            'action_dim': 7,  # 3 linear + 3 angular velocities + gripper target
-            'ee_pose_debug_dim': 7,  # 3 position + 4 quaternion (wxyz)
-            'state_labels': ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'gripper'],
-            'action_labels': ['vx', 'vy', 'vz', 'wx', 'wy', 'wz', 'gripper_target'],
-            'ee_pose_debug_labels': ['ee_x', 'ee_y', 'ee_z', 'ee_qw', 'ee_qx', 'ee_qy', 'ee_qz'],
-            'ee_pose_debug_note': 'End-effector pose trajectory for debugging/inspection only, NOT used by policy',
-            'extra_fields': list(extra_arrays.keys()),
-            'timestamp': datetime.now().isoformat()
-        }
+        metadata=metadata
     )
     
     print(f"\n✓ Trajectory saved to: {output_path}")
@@ -190,7 +203,7 @@ class TeleopControl(RobotControlBase):
             return True
 
         command = self.control_gui.get_command()
-        if command is None or command not in ['h', 'r', 's', 'd']:
+        if command is None or command not in ['h', 'g', 'r', 's', 'd']:
             return
         
         try:
@@ -200,27 +213,7 @@ class TeleopControl(RobotControlBase):
                 print("GUI COMMAND: 'h' - Moving to home position...", flush=True)
                 print("="*60, flush=True)
 
-                # 1) Proactively reset gripper motor (end-effector) in case a previous grasp
-                #    over-torqued it, so it can move freely again.
-                gripper_motor_id = robot_config.motor_ids[-1]
-                try:
-                    self.robot_driver.reboot_motor(gripper_motor_id)
-                except Exception as e:
-                    print(f"⚠️  Warning: Failed to reboot gripper motor: {e}", flush=True)
-
-                # 2) Explicitly command gripper to open before moving the arm joints.
-                try:
-                    gripper_open_encoder = robot_config.gripper_encoder_max
-                    self.robot_driver.send_motor_positions(
-                        {gripper_motor_id: gripper_open_encoder},
-                        velocity_limit=robot_config.velocity_limit
-                    )
-                    # Give gripper a short moment to open
-                    time.sleep(0.3)
-                except Exception as e:
-                    print(f"⚠️  Warning: Failed to send gripper-open command: {e}", flush=True)
-                
-                # Send home command
+                # Send home command (assumes gripper is already healthy/open or will be handled separately)
                 self.robot_driver.send_motor_positions(
                     self.home_motor_positions, 
                     velocity_limit=robot_config.velocity_limit
@@ -235,7 +228,7 @@ class TeleopControl(RobotControlBase):
                 while time.perf_counter() - start_time < movement_duration:
                     # Check for new commands during movement
                     new_cmd = self.control_gui.get_command() if self.control_gui else None
-                    if new_cmd in ['h', 'r', 's']:
+                    if new_cmd in ['h', 'g', 'r', 's']:
                         with self.control_gui.lock:
                             self.control_gui.command_queue.insert(0, new_cmd)
                         print("(Movement interrupted by new command)", flush=True)
@@ -259,6 +252,45 @@ class TeleopControl(RobotControlBase):
                     self.gripper_current_position = robot_joint_angles[5]
                 
                 print(f"✓ Robot moved to home position: {actual_position}", flush=True)
+                print("="*60 + "\n", flush=True)
+            
+            elif command == 'g':
+                # Reset end-effector (gripper) motor only: reboot + open, no arm motion
+                print("\n" + "="*60, flush=True)
+                print("GUI COMMAND: 'g' - Resetting EE (gripper motor)...", flush=True)
+                print("="*60, flush=True)
+
+                gripper_motor_id = robot_config.motor_ids[-1]
+
+                # 1) Reboot gripper motor to clear over-torque / error states
+                try:
+                    self.robot_driver.reboot_motor(gripper_motor_id)
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to reboot gripper motor: {e}", flush=True)
+
+                # 2) Command gripper to open
+                try:
+                    gripper_open_encoder = robot_config.gripper_encoder_max
+                    self.robot_driver.send_motor_positions(
+                        {gripper_motor_id: gripper_open_encoder},
+                        velocity_limit=robot_config.velocity_limit
+                    )
+                    time.sleep(0.3)
+                    print("✓ Gripper reset: motor rebooted and opened.", flush=True)
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to send gripper-open command: {e}", flush=True)
+
+                # 3) Update internal gripper state to match open position
+                try:
+                    robot_encoders = self.robot_driver.read_all_encoders(max_retries=3, retry_delay=0.1)
+                    if 7 in robot_encoders and robot_encoders[7] is not None:
+                        # Use encoder mapping to update current gripper position in sim units
+                        from robot_control.robot_joint_to_motor import encoder_to_gripper_position
+                        self.gripper_current_position = encoder_to_gripper_position(robot_encoders[7])
+                except Exception:
+                    # Non-fatal if we fail to read; next loop will converge from IK
+                    pass
+
                 print("="*60 + "\n", flush=True)
             
             elif command == 'r':

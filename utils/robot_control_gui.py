@@ -3,6 +3,7 @@ Simple GUI for robot control commands.
 
 Provides a lightweight tkinter-based GUI with buttons for robot control:
 - Home: Move robot to home position
+- Reset EE: Reboot & open gripper (no arm motion)
 - Start Recording: Begin/reset trajectory recording
 - Stop & Save: Stop recording and save trajectory
 - Stop & Discard: Stop recording and discard current trajectory
@@ -30,8 +31,8 @@ class SimpleControlGUI:
             
             self.root = tk.Tk()
             self.root.title("WX200 Robot Control")
-            # Slightly taller to comfortably fit 4 buttons + status label
-            self.root.geometry("320x200")
+            # Slightly taller to comfortably fit 5 buttons + status label
+            self.root.geometry("340x240")
             self.root.resizable(False, False)
             
             # Handle window close - mark as not running but don't destroy yet
@@ -57,6 +58,15 @@ class SimpleControlGUI:
                 width=20
             )
             home_btn.pack(pady=5)
+            
+            # Reset EE (gripper) button
+            reset_ee_btn = ttk.Button(
+                frame,
+                text="Reset EE (g)",
+                command=lambda: self._queue_command('g'),
+                width=20
+            )
+            reset_ee_btn.pack(pady=5)
             
             # Start Recording button
             record_btn = ttk.Button(
