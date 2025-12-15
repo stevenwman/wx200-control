@@ -42,12 +42,13 @@ class SpaceMouseReader:
         """Start reading from spacemouse and putting commands in queue"""
         # Suppress stdout during device discovery to hide "SpaceMouse Wireless found" messages
         original_stdout = sys.stdout
+        devnull = open(os.devnull, 'w')
         try:
-            sys.stdout = open(os.devnull, 'w')
+            sys.stdout = devnull
             success = pyspacemouse.open(button_callback=self.button_callback)
         finally:
-            sys.stdout.close()
             sys.stdout = original_stdout
+            devnull.close()
         
         if not success:
             raise RuntimeError("Failed to open spacemouse")

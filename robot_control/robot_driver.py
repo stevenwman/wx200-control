@@ -219,7 +219,7 @@ class RobotDriver:
         Args:
             max_retries: Maximum number of retry attempts per motor
             retry_delay: Delay between retries (seconds)
-        
+            
         Returns:
             dict: {motor_id: encoder_position} for all motors, None if read failed
         """
@@ -242,9 +242,6 @@ class RobotDriver:
                 except Exception:
                     if attempt < max_retries - 1:
                         time.sleep(retry_delay)
-                    else:
-                        # Last attempt failed, keep as None
-                        pass
         
         return encoder_positions
     

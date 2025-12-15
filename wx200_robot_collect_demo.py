@@ -2,11 +2,9 @@
 Teleop control with ArUco marker tracking.
 Inherits from TeleopControl and adds camera support.
 """
-import time
 import cv2
 import numpy as np
 import argparse
-from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
 from wx200_robot_teleop_control import TeleopControl
@@ -179,22 +177,23 @@ class TeleopCameraControl(TeleopControl):
             current_step['aruco_ee_in_object'] = obs['aruco_ee_in_object']
             current_step['aruco_object_in_ee'] = obs['aruco_object_in_ee']
             current_step['aruco_visibility'] = obs['aruco_visibility']
-            
-            # Convert angular velocity [wx, wy, wz] to axis-angle representation
-            # Format: [angle, axis_x, axis_y, axis_z]
-            # where angle is the magnitude and axis is the normalized direction
+
+            # Convert angular velocity [wx, wy, wz] to per-step axis-angle 3-vector.
+            # We encode the actual rotation this timestep:
+            #   axis_angle_vec = omega * dt
+            # so ||axis_angle_vec|| = rotation angle in this step, direction = rotation axis.
             angular_vel = angular_velocity_world
-            angle = np.linalg.norm(angular_vel)
-            if angle > 1e-6:  # Avoid division by zero
-                axis = angular_vel / angle
+            if dt > 0.0:
+                axis_angle_vec = angular_vel * dt
             else:
-                axis = np.array([1., 0., 0.])  # Default axis if no rotation
-            
+                axis_angle_vec = np.zeros(3)
+
+            # Augmented actions: original action + axis-angle 3-vector
             augmented_actions = np.concatenate([
-                velocity_world,  # [vx, vy, vz]
-                angular_velocity_world,  # [wx, wy, wz] (original)
-                [angle, axis[0], axis[1], axis[2]],  # [angle, axis_x, axis_y, axis_z]
-                [gripper_target]  # gripper
+                velocity_world,          # [vx, vy, vz]
+                angular_velocity_world,  # [wx, wy, wz] (original angular velocity)
+                axis_angle_vec,          # 3D axis-angle vector
+                [gripper_target]         # gripper
             ])
             current_step['augmented_actions'] = augmented_actions
 

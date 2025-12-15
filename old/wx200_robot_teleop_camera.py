@@ -149,10 +149,12 @@ class TeleopCameraControl(TeleopControl):
                 pos, quat = self._compute_relative_pose(r_world, t_world, r_obj, t_obj)
                 obs['aruco_object_in_world'] = np.concatenate([pos, quat])
                 
-                # Backward compatibility
+                # Backward compatibility for older pipelines expecting object_pose/object_visible
+                object_pose_data = np.zeros(7, dtype=np.float32)
+                object_visible = 0.0
                 if obs['aruco_visibility'][0] and obs['aruco_visibility'][1]:
                     object_pose_data = obs['aruco_object_in_world']
-                        object_visible = 1.0
+                    object_visible = 1.0
 
                 # 3. EE (3) relative to Object (2)
                 pos, quat = self._compute_relative_pose(r_obj, t_obj, r_ee, t_ee)
@@ -162,10 +164,10 @@ class TeleopCameraControl(TeleopControl):
                 pos, quat = self._compute_relative_pose(r_ee, t_ee, r_obj, t_obj)
                 obs['aruco_object_in_ee'] = np.concatenate([pos, quat])
         
-        # 2. Base Robot Recording (adds to self.trajectory)
+        # 2. Base Robot Recording (adds to self.trajectory: state, action, ee_pose_debug)
         super().on_control_loop_iteration(velocity_world, angular_velocity_world, gripper_target, dt)
         
-        # 3. Augment Trajectory with Composite Observations
+        # 3. Augment Trajectory with Composite Observations (and optionally richer actions)
         if self.is_recording and self.trajectory:
             current_step = self.trajectory[-1]
             
@@ -179,6 +181,24 @@ class TeleopCameraControl(TeleopControl):
             current_step['aruco_ee_in_object'] = obs['aruco_ee_in_object']
             current_step['aruco_object_in_ee'] = obs['aruco_object_in_ee']
             current_step['aruco_visibility'] = obs['aruco_visibility']
+
+            # Optional: Augmented action representation with axis-angle rotation
+            # Convert angular velocity [wx, wy, wz] to axis-angle 3-vector where:
+            #   axis_angle_vec = angle * axis,  ||axis_angle_vec|| = angle
+            angular_vel = angular_velocity_world
+            angle = np.linalg.norm(angular_vel)
+            if angle > 1e-6:
+                axis_angle_vec = angular_vel.copy()   # already axis * angle per-timestep
+            else:
+                axis_angle_vec = np.zeros(3)
+
+            augmented_actions = np.concatenate([
+                velocity_world,          # [vx, vy, vz]
+                angular_velocity_world,  # [wx, wy, wz] (original angular velocity)
+                axis_angle_vec,          # 3D axis-angle vector
+                [gripper_target]         # gripper
+            ])
+            current_step['augmented_actions'] = augmented_actions
 
     def shutdown(self):
         """Cleanup camera and windows."""

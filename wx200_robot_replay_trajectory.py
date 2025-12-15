@@ -71,7 +71,7 @@ class ReplayControl(RobotControlBase):
         print(f"Estimated duration: {self.trajectory['timestamps'][self.end_idx-1] - self.trajectory['timestamps'][self.start_idx]:.2f} seconds")
         print(f"\nStarting replay at {self.control_frequency:.1f} Hz...")
         print("="*60 + "\n")
-    
+        
     def get_action(self, dt):
         """Get action from recorded trajectory."""
         if self.current_idx >= self.end_idx:
@@ -90,7 +90,7 @@ class ReplayControl(RobotControlBase):
             elapsed = time.perf_counter() - self.replay_start_time
             progress = (self.current_idx - self.start_idx) / (self.end_idx - self.start_idx) * 100
             print(f"Replay progress: {self.current_idx}/{self.end_idx} ({progress:.1f}%) - Elapsed: {elapsed:.1f}s")
-    
+        
     def run_control_loop(self):
         """Override to initialize replay timing and handle completion."""
         self.replay_start_time = time.perf_counter()
