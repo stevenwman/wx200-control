@@ -152,7 +152,7 @@ class TeleopCameraControl(TeleopControl):
                 # Backward compatibility
                 if obs['aruco_visibility'][0] and obs['aruco_visibility'][1]:
                     object_pose_data = obs['aruco_object_in_world']
-                        object_visible = 1.0
+                    object_visible = 1.0
 
                 # 3. EE (3) relative to Object (2)
                 pos, quat = self._compute_relative_pose(r_obj, t_obj, r_ee, t_ee)
@@ -165,7 +165,7 @@ class TeleopCameraControl(TeleopControl):
         # 2. Base Robot Recording (adds to self.trajectory)
         super().on_control_loop_iteration(velocity_world, angular_velocity_world, gripper_target, dt)
         
-        # 3. Augment Trajectory with Composite Observations
+        # 3. Augment Trajectory with Composite Observations and Axis-Angle Actions
         if self.is_recording and self.trajectory:
             current_step = self.trajectory[-1]
             
@@ -179,6 +179,24 @@ class TeleopCameraControl(TeleopControl):
             current_step['aruco_ee_in_object'] = obs['aruco_ee_in_object']
             current_step['aruco_object_in_ee'] = obs['aruco_object_in_ee']
             current_step['aruco_visibility'] = obs['aruco_visibility']
+            
+            # Convert angular velocity [wx, wy, wz] to axis-angle representation
+            # Format: [angle, axis_x, axis_y, axis_z]
+            # where angle is the magnitude and axis is the normalized direction
+            angular_vel = angular_velocity_world
+            angle = np.linalg.norm(angular_vel)
+            if angle > 1e-6:  # Avoid division by zero
+                axis = angular_vel / angle
+            else:
+                axis = np.array([1., 0., 0.])  # Default axis if no rotation
+            
+            augmented_actions = np.concatenate([
+                velocity_world,  # [vx, vy, vz]
+                angular_velocity_world,  # [wx, wy, wz] (original)
+                [angle, axis[0], axis[1], axis[2]],  # [angle, axis_x, axis_y, axis_z]
+                [gripper_target]  # gripper
+            ])
+            current_step['augmented_actions'] = augmented_actions
 
     def shutdown(self):
         """Cleanup camera and windows."""
