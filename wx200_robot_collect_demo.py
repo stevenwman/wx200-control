@@ -7,9 +7,13 @@ import numpy as np
 import argparse
 from scipy.spatial.transform import Rotation as R
 
+from robot_control.robot_config import robot_config
 from wx200_robot_teleop_control import TeleopControl
 from camera import Camera, is_gstreamer_available
 from aruco_pose_estimator import ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
+
+# Shorter axes for visualization to reduce chance of going off-frame (and warnings)
+AXIS_LENGTH = MARKER_SIZE * robot_config.aruco_axis_length_scale
 
 class TeleopCameraControl(TeleopControl):
     """
@@ -21,13 +25,15 @@ class TeleopCameraControl(TeleopControl):
     - ID 3: Gripper (optional, logged if found)
     """
     
-    def __init__(self, enable_recording=False, output_path=None, camera_id=1, width=1920, height=1080, fps=30):
+    def __init__(self, enable_recording=False, output_path=None,
+                 camera_id=None, width=None, height=None, fps=None):
         super().__init__(enable_recording=enable_recording, output_path=output_path)
         
-        self.camera_id = camera_id
-        self.width = width
-        self.height = height
-        self.fps = fps
+        # Use config defaults unless overridden explicitly
+        self.camera_id = camera_id if camera_id is not None else robot_config.camera_id
+        self.width = width if width is not None else robot_config.camera_width
+        self.height = height if height is not None else robot_config.camera_height
+        self.fps = fps if fps is not None else robot_config.camera_fps
         
         self.camera = None
         self.estimator = None
@@ -42,6 +48,8 @@ class TeleopCameraControl(TeleopControl):
         
         # Visualization
         self.show_video = True
+        # Draw axes by default, but with reduced length (AXIS_LENGTH) to reduce warnings.
+        self.show_axes = True  # Set to False if you want markers only.
         
     def on_ready(self):
         """Initialize camera and estimator."""
@@ -111,26 +119,42 @@ class TeleopCameraControl(TeleopControl):
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 corners, ids, _ = self.detector.detectMarkers(gray)
                 
-                # Process tags: 0=World, 2=Object, 3=Gripper
-                r_world, t_world = self.estimator.process_tag(corners, ids, self.cam_matrix, self.dist_coeffs, 0)
-                r_obj, t_obj = self.estimator.process_tag(corners, ids, self.cam_matrix, self.dist_coeffs, 2)
-                r_ee, t_ee = self.estimator.process_tag(corners, ids, self.cam_matrix, self.dist_coeffs, 3)
+                # Process tags using configured IDs
+                r_world, t_world = self.estimator.process_tag(
+                    corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_world_id
+                )
+                r_obj, t_obj = self.estimator.process_tag(
+                    corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_object_id
+                )
+                r_ee, t_ee = self.estimator.process_tag(
+                    corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_ee_id
+                )
                 
-                # Update visibility flags
-                obs['aruco_visibility'][0] = 1.0 if r_world is not None else 0.0
-                obs['aruco_visibility'][1] = 1.0 if r_obj is not None else 0.0
-                obs['aruco_visibility'][2] = 1.0 if r_ee is not None else 0.0
+                # Update visibility flags based on actual detections (not just held poses)
+                world_visible = False
+                object_visible = False
+                ee_visible = False
+                if ids is not None:
+                    ids_arr = np.atleast_1d(ids).ravel()
+                    world_visible = np.any(ids_arr == robot_config.aruco_world_id)
+                    object_visible = np.any(ids_arr == robot_config.aruco_object_id)
+                    ee_visible = np.any(ids_arr == robot_config.aruco_ee_id)
+
+                obs['aruco_visibility'][0] = 1.0 if world_visible else 0.0
+                obs['aruco_visibility'][1] = 1.0 if object_visible else 0.0
+                obs['aruco_visibility'][2] = 1.0 if ee_visible else 0.0
                 
                 # Visualization
                 if self.show_video:
                     if ids is not None:
                         cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-                    if r_world is not None:
-                        cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_world, t_world, MARKER_SIZE)
-                    if r_obj is not None:
-                        cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_obj, t_obj, MARKER_SIZE)
-                    if r_ee is not None:
-                        cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_ee, t_ee, MARKER_SIZE)
+                    if self.show_axes:
+                        if r_world is not None:
+                            cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_world, t_world, AXIS_LENGTH)
+                        if r_obj is not None:
+                            cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_obj, t_obj, AXIS_LENGTH)
+                        if r_ee is not None:
+                            cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_ee, t_ee, AXIS_LENGTH)
                     
                     # Resize for display
                     disp = cv2.resize(frame, (640, 360))
@@ -206,7 +230,9 @@ class TeleopCameraControl(TeleopControl):
 
 def main():
     parser = argparse.ArgumentParser(description='WX200 Teleop with Camera')
-    parser.add_argument('--record', action='store_true', help='Enable recording')
+    # Note: Recording is controlled via the GUI (Start/Stop/Discard buttons).
+    # This flag is kept only for CLI compatibility and is ignored.
+    parser.add_argument('--record', action='store_true', help='(Deprecated) Recording is controlled via GUI')
     parser.add_argument('--output', type=str, help='Output filename')
     parser.add_argument('--camera-id', type=int, default=1, help='Camera device ID')
     parser.add_argument('--no-vis', action='store_true', help='Disable video window')
@@ -215,7 +241,8 @@ def main():
     
     # Create and run
     controller = TeleopCameraControl(
-        enable_recording=args.record,
+        # Always enable recording capability; GUI decides when to actually record.
+        enable_recording=True,
         output_path=args.output,
         camera_id=args.camera_id
     )

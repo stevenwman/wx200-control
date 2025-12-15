@@ -36,7 +36,7 @@ def save_trajectory(trajectory, output_path):
     # EE pose trajectory (debug data, not used by policy)
     ee_poses_debug = np.array([t['ee_pose_debug'] for t in trajectory])
     
-    # Check for additional fields (e.g., object_pose)
+    # Check for additional fields (e.g., object_pose, aruco_visibility)
     extra_arrays = {}
     if trajectory:
         for key in trajectory[0].keys():
@@ -75,6 +75,14 @@ def save_trajectory(trajectory, output_path):
         print(f"  - Duration: {timestamps[-1]:.2f} seconds")
         print(f"  - Frequency: {len(trajectory) / timestamps[-1]:.2f} Hz")
     print(f"  - Includes EE pose trajectory (debug data)")
+
+    # If ArUco visibility was recorded, warn if there were any frames with missing tags
+    if 'aruco_visibility' in extra_arrays:
+        vis = extra_arrays['aruco_visibility']  # shape (N, 3)
+        if np.any(vis < 1.0):
+            total_frames = vis.shape[0]
+            missing_frames = int(np.sum(np.any(vis < 1.0, axis=1)))
+            print(f"  - ⚠️ ArUco visibility warning: {missing_frames}/{total_frames} frames had at least one marker out of view.")
 
 
 class TeleopControl(RobotControlBase):
@@ -169,8 +177,20 @@ class TeleopControl(RobotControlBase):
         if not self.control_gui or not self.control_gui.is_available():
             return
         
+        def _require_recording_enabled():
+            if not self.enable_recording:
+                print("\n⚠️  Recording not enabled. Start script with --record flag.\n", flush=True)
+                return False
+            return True
+
+        def _require_active_recording():
+            if not self.is_recording:
+                print("\n⚠️  Not currently recording. Press 'r' to start recording first.\n", flush=True)
+                return False
+            return True
+
         command = self.control_gui.get_command()
-        if command is None or command not in ['h', 'r', 's']:
+        if command is None or command not in ['h', 'r', 's', 'd']:
             return
         
         try:
@@ -179,6 +199,26 @@ class TeleopControl(RobotControlBase):
                 print("\n" + "="*60, flush=True)
                 print("GUI COMMAND: 'h' - Moving to home position...", flush=True)
                 print("="*60, flush=True)
+
+                # 1) Proactively reset gripper motor (end-effector) in case a previous grasp
+                #    over-torqued it, so it can move freely again.
+                gripper_motor_id = robot_config.motor_ids[-1]
+                try:
+                    self.robot_driver.reboot_motor(gripper_motor_id)
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to reboot gripper motor: {e}", flush=True)
+
+                # 2) Explicitly command gripper to open before moving the arm joints.
+                try:
+                    gripper_open_encoder = robot_config.gripper_encoder_max
+                    self.robot_driver.send_motor_positions(
+                        {gripper_motor_id: gripper_open_encoder},
+                        velocity_limit=robot_config.velocity_limit
+                    )
+                    # Give gripper a short moment to open
+                    time.sleep(0.3)
+                except Exception as e:
+                    print(f"⚠️  Warning: Failed to send gripper-open command: {e}", flush=True)
                 
                 # Send home command
                 self.robot_driver.send_motor_positions(
@@ -213,16 +253,19 @@ class TeleopControl(RobotControlBase):
                 self.robot_controller.reset_pose(actual_position, actual_orientation_quat_wxyz)
                 current_target_pose = self.robot_controller.get_target_pose()
                 self.robot_controller.end_effector_task.set_target(current_target_pose)
+
+                # Keep gripper command state in sync with physical gripper after homing
+                if len(robot_joint_angles) > 5:
+                    self.gripper_current_position = robot_joint_angles[5]
                 
                 print(f"✓ Robot moved to home position: {actual_position}", flush=True)
                 print("="*60 + "\n", flush=True)
             
             elif command == 'r':
                 # Start recording (reset timestep)
-                if not self.enable_recording:
-                    print("\n⚠️  Recording not enabled. Start script with --record flag.\n", flush=True)
+                if not _require_recording_enabled():
                     return
-                
+                    
                 print("\n" + "="*60, flush=True)
                 print("GUI COMMAND: 'r' - Starting new recording (resetting timestep)...", flush=True)
                 print("="*60, flush=True)
@@ -234,12 +277,9 @@ class TeleopControl(RobotControlBase):
             
             elif command == 's':
                 # Stop recording and save
-                if not self.enable_recording:
-                    print("\n⚠️  Recording not enabled. Start script with --record flag.\n", flush=True)
+                if not _require_recording_enabled():
                     return
-                
-                if not self.is_recording:
-                    print("\n⚠️  Not currently recording. Press 'r' to start recording first.\n", flush=True)
+                if not _require_active_recording():
                     return
                 
                 if not self.trajectory:
@@ -279,6 +319,25 @@ class TeleopControl(RobotControlBase):
                 self.recording_start_time = None
                 self.is_recording = False  # IMPORTANT: Stop recording
                 
+                print("="*60 + "\n", flush=True)
+            
+            elif command == 'd':
+                # Stop recording and discard current trajectory
+                if not _require_recording_enabled():
+                    return
+                if not _require_active_recording():
+                    return
+                
+                print("\n" + "="*60, flush=True)
+                print("GUI COMMAND: 'd' - Stopping and discarding current trajectory...", flush=True)
+                print("="*60, flush=True)
+                
+                # Discard current trajectory and reset flags
+                self.trajectory = []
+                self.recording_start_time = None
+                self.is_recording = False
+                
+                print("✓ Current trajectory discarded (no file saved).", flush=True)
                 print("="*60 + "\n", flush=True)
         except Exception as e:
             print(f"\n⚠️  Error handling GUI command '{command}': {e}\n", flush=True)

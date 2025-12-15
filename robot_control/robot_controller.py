@@ -145,6 +145,27 @@ class RobotController:
         self._prev_velocity_active = velocity_active
         
         # Get target pose and set for IK
+        # Clamp target position to configured workspace bounds for safety
+        target_position = self.pose_controller.get_target_position()
+        target_orientation = self.pose_controller.get_target_orientation_quat_wxyz()
+        
+        bounds_min = np.array([
+            robot_config.ee_bound_x[0],
+            robot_config.ee_bound_y[0],
+            robot_config.ee_bound_z[0],
+        ])
+        bounds_max = np.array([
+            robot_config.ee_bound_x[1],
+            robot_config.ee_bound_y[1],
+            robot_config.ee_bound_z[1],
+        ])
+        clamped_position = np.clip(target_position, bounds_min, bounds_max)
+        
+        # If clamped, update the pose controller to avoid accumulating out-of-bounds targets
+        if not np.allclose(clamped_position, target_position, atol=1e-9):
+            self.pose_controller.reset_pose(clamped_position, target_orientation)
+        
+        # Set IK target (pose controller now holds the clamped position)
         target_pose = self.pose_controller.get_target_pose_se3()
         self.end_effector_task.set_target(target_pose)
         

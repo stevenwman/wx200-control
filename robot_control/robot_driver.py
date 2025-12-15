@@ -63,6 +63,46 @@ class RobotDriver:
         
         time.sleep(0.5)  # Wait for motors to initialize after reboot
     
+    def reboot_motor(self, motor_id):
+        """
+        Reboot a single motor to clear error states (e.g., over-torque on gripper).
+        
+        This is useful when a specific joint (like the gripper) has latched an error
+        but you don't want to reset the entire robot.
+        """
+        if not self.portHandler or not self.packetHandler:
+            raise RuntimeError("Port not initialized. Call connect() first.")
+        
+        if motor_id not in robot_config.motor_ids:
+            print(f"Warning: Attempted to reboot unknown motor ID {motor_id}")
+            return
+        
+        try:
+            print(f"Rebooting motor {motor_id} to clear error state...")
+            dxl_comm_result, dxl_error = self.packetHandler.reboot(self.portHandler, motor_id)
+            if dxl_comm_result != COMM_SUCCESS:
+                error_msg = self.packetHandler.getTxRxResult(dxl_comm_result)
+                print(f"Warning: Failed to reboot motor {motor_id}: {error_msg}")
+                return
+            
+            # After reboot, torque is typically disabled; re-enable it for this motor.
+            time.sleep(0.1)
+            dxl_comm_result, dxl_error = self.packetHandler.write1ByteTxRx(
+                self.portHandler, motor_id, robot_config.addr_torque_enable, 1
+            )
+            if dxl_comm_result != COMM_SUCCESS:
+                error_msg = self.packetHandler.getTxRxResult(dxl_comm_result)
+                print(f"Warning: Failed to re-enable torque on motor {motor_id}: {error_msg}")
+            elif dxl_error != 0:
+                error_msg = self.packetHandler.getRxPacketError(dxl_error)
+                print(f"Warning: Motor {motor_id} reported error after reboot: {error_msg}")
+            else:
+                print(f"Motor {motor_id} rebooted and torque re-enabled.")
+            
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"Warning: Exception while rebooting motor {motor_id}: {e}")
+    
     def connect(self):
         """Connect to robot, reboot motors to clear errors, and enable torque on all motors."""
         self.portHandler = PortHandler(self.devicename)

@@ -1,13 +1,24 @@
 import cv2
 import numpy as np
+from robot_control.robot_config import robot_config
 
-# --- Configuration ---
-MARKER_SIZE = 0.050  # meters (50mm) - 5x5 Tags (World, Object, Gripper)
+# Suppress noisy OpenCV WARN logs from drawFrameAxes / solvePnP when axes go off-frame
+try:
+    # Newer OpenCV
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    try:
+        # Older OpenCV fallback (3 = ERROR)
+        cv2.setLogLevel(3)
+    except Exception:
+        pass
 
-# Validation Constants
-SINGLE_TAG_ROTATION_THRESHOLD = 0.8
-SINGLE_TAG_TRANSLATION_THRESHOLD = 0.2
-MAX_PRESERVE_FRAMES = 5
+# --- Configuration (sourced from robot_config) ---
+MARKER_SIZE = robot_config.aruco_marker_size_m  # meters - 5x5 Tags (World, Object, Gripper)
+SINGLE_TAG_ROTATION_THRESHOLD = robot_config.aruco_single_tag_rotation_threshold
+SINGLE_TAG_TRANSLATION_THRESHOLD = robot_config.aruco_single_tag_translation_threshold
+MAX_PRESERVE_FRAMES = robot_config.aruco_max_preserve_frames
+MAX_REJECTIONS_BEFORE_FORCE = robot_config.aruco_max_rejections_before_force
 
 def get_approx_camera_matrix(width, height):
     """Get approximate camera matrix based on frame dimensions."""
@@ -45,7 +56,11 @@ class ArUcoPoseEstimator:
 
     def process_tag(self, corners, ids, cam_matrix, dist_coeffs, target_id):
         """Process a single tag with robust validation and smoothing."""
-        idx = np.where(ids == target_id)[0]
+        # Guard against None or scalar ids from OpenCV
+        if ids is None:
+            return None, None
+        ids_arr = np.atleast_1d(ids).ravel()
+        idx = np.where(ids_arr == target_id)[0]
         state = self._get_tag_state(target_id)
         
         # 1. Handle Missing
@@ -125,8 +140,8 @@ class ArUcoPoseEstimator:
         else:
             # Rejection logic (persistence check)
             state['consecutive_rejections'] += 1
-            if state['consecutive_rejections'] > 5:
-                # Force accept after 5 frames
+            if state['consecutive_rejections'] > MAX_REJECTIONS_BEFORE_FORCE:
+                # Force accept after too many rejected frames
                 state['last_valid_rvec'] = rvec
                 state['last_valid_tvec'] = tvec
                 state['consecutive_rejections'] = 0

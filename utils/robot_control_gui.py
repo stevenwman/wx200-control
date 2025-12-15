@@ -1,17 +1,18 @@
 """
 Simple GUI for robot control commands.
 
-Provides a lightweight tkinter-based GUI with 3 buttons for robot control:
+Provides a lightweight tkinter-based GUI with buttons for robot control:
 - Home: Move robot to home position
 - Start Recording: Begin/reset trajectory recording
 - Stop & Save: Stop recording and save trajectory
+- Stop & Discard: Stop recording and discard current trajectory
 """
 import time
 import threading
 
 
 class SimpleControlGUI:
-    """Simple GUI with 3 buttons for robot control."""
+    """Simple GUI with buttons for robot control."""
     
     def __init__(self):
         self.command_queue = []
@@ -29,7 +30,8 @@ class SimpleControlGUI:
             
             self.root = tk.Tk()
             self.root.title("WX200 Robot Control")
-            self.root.geometry("300x150")
+            # Slightly taller to comfortably fit 4 buttons + status label
+            self.root.geometry("320x200")
             self.root.resizable(False, False)
             
             # Handle window close - mark as not running but don't destroy yet
@@ -73,6 +75,15 @@ class SimpleControlGUI:
                 width=20
             )
             save_btn.pack(pady=5)
+            
+            # Stop & Discard button
+            discard_btn = ttk.Button(
+                frame,
+                text="Stop & Discard (d)",
+                command=lambda: self._queue_command('d'),
+                width=20
+            )
+            discard_btn.pack(pady=5)
             
             # Status label
             self.status_label = ttk.Label(frame, text="Ready", foreground="green")

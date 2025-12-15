@@ -58,6 +58,29 @@ class RobotConfig:
     velocity_limit: int = 40  # Speed limit for movements (0=Max, 30=Slow/Safe)
     control_frequency: float = 20.0  # Control loop frequency (Hz)
     
+    # Vision / camera configuration
+    camera_id: int = 1
+    camera_width: int = 1920
+    camera_height: int = 1080
+    camera_fps: int = 30
+    
+    # ArUco marker configuration
+    aruco_marker_size_m: float = 0.030  # meters (default: 30mm)
+    aruco_world_id: int = 0
+    aruco_object_id: int = 2
+    aruco_ee_id: int = 3
+    aruco_axis_length_scale: float = 0.5  # fraction of marker size for axis length
+    aruco_single_tag_rotation_threshold: float = 0.8
+    aruco_single_tag_translation_threshold: float = 0.2
+    aruco_max_preserve_frames: int = 8
+    aruco_max_rejections_before_force: int = 5
+    
+    # End-effector workspace bounds (meters) for safety clamping
+    # Format: (min, max) for X, Y, Z in world frame
+    ee_bound_x: tuple = (0.05, 0.90)   # meters
+    ee_bound_y: tuple = (-0.20, 0.20)  # meters
+    ee_bound_z: tuple = (0.02, 0.40)   # meters
+    
     # Startup home position (encoder values for motors 1-7)
     # If None, will compute from sim keyframe. Otherwise, uses these exact positions.
     # Example: startup_home_positions = [1724, 1388, 2708, 1540, 1416, 2023, 2754]
@@ -76,7 +99,8 @@ class RobotConfig:
         if self.startup_home_positions is None:
             # Default: use configured home positions
             # Set to None to compute from sim keyframe instead
-            self.startup_home_positions = [1724, 1388, 2708, 1540, 1416, 2023, 2754]
+            # self.startup_home_positions = [1724, 1388, 2708, 1540, 1416, 2023, 2754]
+            self.startup_home_positions = [2070, 1646, 2453, 1613, 1460, 2011, 2756]
         if self.reasonable_home_pose is None:
             self.reasonable_home_pose = [-1, 1382, 2712, 1568, 1549, 2058, 1784]
         if self.base_home_pose is None:

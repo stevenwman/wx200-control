@@ -9,5 +9,6 @@ dynamixel-sdk
 matplotlib
 opencv-python
 plotly
+dash
 nbformat>=4.2.0
 ipywidgets
