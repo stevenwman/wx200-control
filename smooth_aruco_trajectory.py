@@ -205,23 +205,72 @@ def main():
     import sys
     
     if len(sys.argv) > 1:
-        input_path = Path(sys.argv[1])
-    else:
-        # Default: most recent trajectory
-        data_dir = Path(__file__).parent / "data"
-        traj_files = sorted(data_dir.glob("trajectory_*.npz"))
-        if not traj_files:
-            print("No trajectory files found in data/")
+        input_arg = Path(sys.argv[1])
+        
+        # Check if it's a file or directory
+        if input_arg.is_file():
+            # Single file mode
+            if not input_arg.exists():
+                print(f"Error: File not found: {input_arg}")
+                return
+            output_path = input_arg.parent / f"{input_arg.stem}_smoothed.npz"
+            smooth_trajectory_file(input_arg, output_path)
+        elif input_arg.is_dir():
+            # Directory mode: process all trajectory files
+            process_directory(input_arg)
+        else:
+            print(f"Error: Path not found: {input_arg}")
             return
-        input_path = traj_files[-1]
-        print(f"No file specified, using most recent: {input_path}")
+    else:
+        # Default: process unsmoothed_data folder
+        data_dir = Path(__file__).parent / "data" / "unsmoothed_data"
+        if data_dir.exists():
+            print(f"No path specified, processing all trajectories in: {data_dir}")
+            process_directory(data_dir)
+        else:
+            print(f"Error: Default directory not found: {data_dir}")
+            print("Usage: python smooth_aruco_trajectory.py [file_or_directory]")
+
+
+def process_directory(directory: Path):
+    """Process all trajectory files in a directory, excluding quarantined ones."""
+    # Find all trajectory_*.npz files, excluding quarantined
+    traj_files = [
+        f for f in sorted(directory.glob("trajectory_*.npz"))
+        if not f.name.startswith("quarantined_")
+    ]
     
-    if not input_path.exists():
-        print(f"Error: File not found: {input_path}")
+    if not traj_files:
+        print(f"No trajectory files found in {directory}")
         return
     
-    output_path = input_path.parent / f"{input_path.stem}_smoothed.npz"
-    smooth_trajectory_file(input_path, output_path)
+    print(f"Found {len(traj_files)} trajectory files to process")
+    print("="*60)
+    
+    processed = 0
+    skipped = 0
+    errors = 0
+    
+    for i, input_path in enumerate(traj_files, 1):
+        print(f"\n[{i}/{len(traj_files)}] Processing: {input_path.name}")
+        
+        # Check if smoothed version already exists
+        output_path = input_path.parent / f"{input_path.stem}_smoothed.npz"
+        if output_path.exists():
+            print(f"  ⏭️  Skipping (smoothed file already exists)")
+            skipped += 1
+            continue
+        
+        try:
+            smooth_trajectory_file(input_path, output_path)
+            processed += 1
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
+            errors += 1
+    
+    print("\n" + "="*60)
+    print(f"Summary: {processed} processed, {skipped} skipped, {errors} errors")
+    print("="*60)
 
 
 if __name__ == "__main__":

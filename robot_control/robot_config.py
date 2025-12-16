@@ -59,7 +59,9 @@ class RobotConfig:
     control_frequency: float = 20.0  # Control loop frequency (Hz)
     
     # Vision / camera configuration
-    camera_id: int = 1
+    # Note: camera_id maps to /dev/video{camera_id}
+    # Use: v4l2-ctl --list-devices to find your camera
+    camera_id: int = 2  # Changed from 1 to 2 (maps to /dev/video2 for UC70 camera)
     camera_width: int = 1920
     camera_height: int = 1080
     camera_fps: int = 30

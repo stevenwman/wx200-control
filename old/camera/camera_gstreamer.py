@@ -196,7 +196,7 @@ def test_gstreamer_camera():
 if __name__ == "__main__":
     if not GSTREAMER_AVAILABLE:
         print("\nCannot run without PyGObject/GStreamer installed.")
-        print("See INSTALL_GSTREAMER.md for installation instructions.")
+        print("See GSTREAMER_GUIDE.md for installation instructions.")
         exit(1)
     
     result = test_gstreamer_camera()

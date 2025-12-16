@@ -22,7 +22,7 @@ from dash import Dash, dcc, html, Input, Output, State
 # --------------------------------------------------------------------------- #
 # Constants / styles
 # --------------------------------------------------------------------------- #
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent / "data/unsmoothed_data"
 
 DARK_BG = "#111111"
 DARK_FG = "#EEEEEE"
@@ -449,7 +449,7 @@ def make_actions_figure(traj, title_suffix: str):
             y=actions[:, gripper_idx],
             mode="lines",
             name=action_labels[gripper_idx],
-            line=dict(color="black"),
+            line=dict(color="red"),
         ),
         row=nrows,
         col=1,
