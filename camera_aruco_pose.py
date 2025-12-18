@@ -10,7 +10,7 @@ import argparse
 from collections import deque
 
 from camera import GStreamerCamera, is_gstreamer_available
-from aruco_pose_estimator import ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
+from camera import ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
 
 def main():
     parser = argparse.ArgumentParser()

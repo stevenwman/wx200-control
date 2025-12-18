@@ -33,10 +33,10 @@ python -c "import gi; gi.require_version('Gst', '1.0'); from gi.repository impor
 
 After installation, test with:
 ```bash
-python camera_gstreamer.py
+python check_gstreamer_pipeline.py --test
 ```
 
-This should show better FPS than OpenCV (closer to 30 FPS instead of 15 FPS).
+This will check the pipeline status and read a few frames to verify everything is working. The GStreamer camera should achieve better FPS than OpenCV (closer to 30 FPS instead of 15 FPS).
 
 ---
 

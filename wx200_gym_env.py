@@ -13,8 +13,7 @@ from scipy.spatial.transform import Rotation as R
 from robot_control.robot_config import robot_config
 from robot_control.robot_control_base import RobotControlBase
 from robot_control.robot_joint_to_motor import sync_robot_to_mujoco
-from camera import Camera, is_gstreamer_available
-from aruco_pose_estimator import ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
+from camera import Camera, is_gstreamer_available, ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
 
 AXIS_LENGTH = MARKER_SIZE * robot_config.aruco_axis_length_scale
 

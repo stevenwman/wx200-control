@@ -105,10 +105,34 @@ class GStreamerCamera:
         self.appsink.set_property('emit-signals', True)
         self.appsink.connect('new-sample', self._on_new_sample)
         
-        # Start pipeline
+        # Start pipeline and wait for state change to complete
         ret = self.pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("Failed to start GStreamer pipeline")
+            raise RuntimeError(
+                f"Failed to start GStreamer pipeline for device {self.device}. "
+                f"Device may be busy or unavailable. Check with: lsof {self.device}"
+            )
+        
+        # Wait for async state changes to complete (timeout after 5 seconds)
+        if ret == Gst.StateChangeReturn.ASYNC:
+            ret, state, pending = self.pipeline.get_state(timeout=5 * Gst.SECOND)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError(
+                    f"Failed to start GStreamer pipeline for device {self.device}. "
+                    f"Device may be busy or unavailable. Check with: lsof {self.device}"
+                )
+            elif ret == Gst.StateChangeReturn.ASYNC:
+                # Still pending after timeout - this indicates the device may be busy
+                raise RuntimeError(
+                    f"Pipeline state change timed out for device {self.device}. "
+                    f"Device may be busy. Current state: {state}, pending: {pending}. "
+                    f"Check with: lsof {self.device}"
+                )
+            elif state != Gst.State.PLAYING:
+                raise RuntimeError(
+                    f"Pipeline did not reach PLAYING state for device {self.device}. "
+                    f"Current state: {state}"
+                )
         
     def read(self):
         """
@@ -217,6 +241,12 @@ class GStreamerCamera:
         """Stop and cleanup."""
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
+            # Wait for state change to complete
+            try:
+                self.pipeline.get_state(timeout=Gst.SECOND)
+            except Exception:
+                pass  # Ignore errors during cleanup
             self.pipeline = None
+            self.appsink = None
             self.frame = None
             self.frame_available = False

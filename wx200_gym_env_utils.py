@@ -11,10 +11,10 @@ from gymnasium.spaces import Box
 from scipy.spatial.transform import Rotation as R
 
 from robot_control.robot_config import robot_config
-from robot_control.robot_control_base import RobotControlBase
-from robot_control.robot_joint_to_motor import sync_robot_to_mujoco
-from camera import Camera, is_gstreamer_available
-from aruco_pose_estimator import ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
+from robot_control.robot_control_base import RobotControlBase, get_sim_home_pose
+from robot_control.robot_joint_to_motor import sync_robot_to_mujoco, encoder_to_gripper_position
+from robot_control.robot_startup import get_home_motor_positions
+from camera import Camera, is_gstreamer_available, ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
 
 AXIS_LENGTH = MARKER_SIZE * robot_config.aruco_axis_length_scale
 
@@ -229,9 +229,16 @@ class WX200GymEnvBase(gym.Env):
                                  aruco_ee_in_world (7D), gripper (1D)] = 22D
         
         Also stores ArUco observations in self.aruco_obs_dict for access.
+        
+        Gripper state is read from MuJoCo configuration (same as joint angles).
         """
         # Get ArUco observations as dict
         self.aruco_obs_dict = self._get_aruco_observations_dict()
+        
+        # Get gripper position from MuJoCo configuration (same as joint angles)
+        # configuration.q[5] is the gripper joint in sim units
+        # The configuration always has at least 6 elements (5 arm joints + gripper) after initialization
+        gripper_pos = self.robot_base.configuration.q[5]
         
         # Extract specific poses for observation array:
         # [aruco_obj_in_world, aruco_obj_in_ee, aruco_ee_in_world, gripper]
@@ -239,7 +246,7 @@ class WX200GymEnvBase(gym.Env):
             self.aruco_obs_dict['aruco_object_in_world'],  # 7D
             self.aruco_obs_dict['aruco_object_in_ee'],    # 7D
             self.aruco_obs_dict['aruco_ee_in_world'],     # 7D
-            [self.robot_base.gripper_current_position]    # 1D
+            [gripper_pos]                                  # 1D (from MuJoCo configuration)
         ])
         
         return obs.astype(np.float32)
@@ -357,9 +364,6 @@ class WX200GymEnvBase(gym.Env):
                 pass
         
         # Move to startup home position (not reasonable_home_pose which is for shutdown)
-        from robot_control.robot_startup import get_home_motor_positions
-        from robot_control.robot_control_base import get_sim_home_pose
-        
         home_qpos, _, _ = get_sim_home_pose(self.robot_base.model)
         home_motor_positions = get_home_motor_positions(self.robot_base.translator, home_qpos=home_qpos)
         
@@ -413,7 +417,6 @@ class WX200GymEnvBase(gym.Env):
             
             # Verify gripper encoder matches (for debugging)
             if gripper_motor_id in robot_encoders and robot_encoders[gripper_motor_id] is not None:
-                from robot_control.robot_joint_to_motor import encoder_to_gripper_position
                 actual_gripper_pos = encoder_to_gripper_position(robot_encoders[gripper_motor_id])
                 print(f"Reset: Gripper encoder {robot_encoders[gripper_motor_id]} -> position {actual_gripper_pos:.6f}")
                 print(f"Reset: Set gripper_current_position to open: {self.robot_base.gripper_current_position:.6f}")

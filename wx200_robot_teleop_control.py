@@ -33,14 +33,14 @@ def save_trajectory(trajectory, output_path):
     states = np.array([t['state'] for t in trajectory])
     actions = np.array([t['action'] for t in trajectory])
     
-    # EE pose trajectory (debug data, not used by policy)
-    ee_poses_debug = np.array([t['ee_pose_debug'] for t in trajectory])
+    # EE pose trajectory (target/commanded pose from IK solver)
+    ee_poses_target = np.array([t['ee_pose_target'] for t in trajectory])
     
     # Check for additional fields (e.g., object_pose, aruco_visibility)
     extra_arrays = {}
     if trajectory:
         for key in trajectory[0].keys():
-            if key not in ['timestamp', 'state', 'action', 'ee_pose_debug']:
+            if key not in ['timestamp', 'state', 'action', 'ee_pose_target']:
                 try:
                     extra_arrays[key] = np.array([t[key] for t in trajectory])
                 except Exception as e:
@@ -53,11 +53,11 @@ def save_trajectory(trajectory, output_path):
         'duration_seconds': timestamps[-1] if len(timestamps) > 0 else 0.0,
         'state_dim': 6,  # 5 joints + gripper
         'action_dim': 7,  # 3 linear + 3 angular velocities + gripper target
-        'ee_pose_debug_dim': 7,  # 3 position + 4 quaternion (wxyz)
+        'ee_pose_target_dim': 7,  # 3 position + 4 quaternion (wxyz)
         'state_labels': ['joint_0', 'joint_1', 'joint_2', 'joint_3', 'joint_4', 'gripper'],
         'action_labels': ['vx', 'vy', 'vz', 'wx', 'wy', 'wz', 'gripper_target'],
-        'ee_pose_debug_labels': ['ee_x', 'ee_y', 'ee_z', 'ee_qw', 'ee_qx', 'ee_qy', 'ee_qz'],
-        'ee_pose_debug_note': 'End-effector pose trajectory for debugging/inspection only, NOT used by policy',
+        'ee_pose_target_labels': ['ee_x', 'ee_y', 'ee_z', 'ee_qw', 'ee_qx', 'ee_qy', 'ee_qz'],
+        'ee_pose_target_note': 'Target/commanded end-effector pose from IK solver (what we are trying to achieve)',
         'extra_fields': list(extra_arrays.keys()),
         'timestamp': datetime.now().isoformat()
     }
@@ -77,7 +77,7 @@ def save_trajectory(trajectory, output_path):
         timestamps=timestamps,
         states=states,
         actions=actions,
-        ee_poses_debug=ee_poses_debug,  # Debug data for inspection
+        ee_poses_target=ee_poses_target,  # Target/commanded pose from IK solver
         **extra_arrays,
         metadata=metadata
     )
@@ -87,7 +87,15 @@ def save_trajectory(trajectory, output_path):
     if len(timestamps) > 0 and timestamps[-1] > 0:
         print(f"  - Duration: {timestamps[-1]:.2f} seconds")
         print(f"  - Frequency: {len(trajectory) / timestamps[-1]:.2f} Hz")
-    print(f"  - Includes EE pose trajectory (debug data)")
+    print(f"  - Includes target EE pose trajectory (ee_pose_target: IK solver's commanded pose)")
+    
+    # If encoder values were recorded, note it
+    if 'encoder_values' in extra_arrays:
+        print(f"  - ✓ Includes encoder values (raw hardware readings)")
+    
+    # If encoder-based FK pose was recorded, note it
+    if 'ee_pose_encoder' in extra_arrays:
+        print(f"  - ✓ Includes encoder-based EE pose (ee_pose_encoder: ground truth from encoders)")
 
     # If ArUco visibility was recorded, warn if there were any frames with missing tags
     if 'aruco_visibility' in extra_arrays:

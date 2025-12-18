@@ -9,8 +9,7 @@ from scipy.spatial.transform import Rotation as R
 
 from robot_control.robot_config import robot_config
 from wx200_robot_teleop_control import TeleopControl
-from camera import Camera, is_gstreamer_available
-from aruco_pose_estimator import ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
+from camera import Camera, is_gstreamer_available, ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
 
 # Shorter axes for visualization to reduce chance of going off-frame (and warnings)
 AXIS_LENGTH = MARKER_SIZE * robot_config.aruco_axis_length_scale
@@ -237,7 +236,7 @@ def main():
     # This flag is kept only for CLI compatibility and is ignored.
     parser.add_argument('--record', action='store_true', help='(Deprecated) Recording is controlled via GUI')
     parser.add_argument('--output', type=str, help='Output filename')
-    parser.add_argument('--camera-id', type=int, default=1, help='Camera device ID')
+    parser.add_argument('--camera-id', type=int, default=None, help='Camera device ID (defaults to robot_config.camera_id)')
     parser.add_argument('--no-vis', action='store_true', help='Disable video window')
     
     args = parser.parse_args()
