@@ -102,7 +102,8 @@ class RobotConfig:
             # Default: use configured home positions
             # Set to None to compute from sim keyframe instead
             # self.startup_home_positions = [1724, 1388, 2708, 1540, 1416, 2023, 2754]
-            self.startup_home_positions = [2070, 1646, 2453, 1613, 1460, 2011, 2756]
+            # self.startup_home_positions = [2070, 1646, 2453, 1613, 1460, 2011, 2756]
+            self.startup_home_positions = [2462, 1496, 2603, 1405, 1400, 2104, 2766]
         if self.reasonable_home_pose is None:
             self.reasonable_home_pose = [-1, 1382, 2712, 1568, 1549, 2058, 1784]
         if self.base_home_pose is None:

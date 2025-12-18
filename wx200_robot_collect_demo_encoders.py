@@ -16,7 +16,7 @@ from scipy.spatial.transform import Rotation as R
 from robot_control.robot_config import robot_config
 from wx200_robot_teleop_control import TeleopControl, save_trajectory
 from camera import Camera, is_gstreamer_available, ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
-from robot_control.robot_joint_to_motor import sync_robot_to_mujoco
+from robot_control.robot_joint_to_motor import JointToMotorTranslator, encoders_to_joint_angles
 
 # Shorter axes for visualization to reduce chance of going off-frame (and warnings)
 AXIS_LENGTH = MARKER_SIZE * robot_config.aruco_axis_length_scale
@@ -133,9 +133,13 @@ class TeleopCameraControlEncoders(TeleopControl):
         poll_start = time.perf_counter()
         
         # Track interval since last poll
+        # Only include intervals that are reasonable (< 1 second) to exclude gaps between recording sessions
         if self.last_poll_timestamp is not None:
             interval = poll_start - self.last_poll_timestamp
-            self.encoder_poll_intervals.append(interval)
+            # Only track intervals < 1 second (reasonable for 20Hz polling)
+            # Larger intervals indicate gaps between recording sessions
+            if interval < 1.0:
+                self.encoder_poll_intervals.append(interval)
             interval_freq = 1.0 / interval if interval > 0 else 0
         else:
             interval = 0.0
@@ -151,21 +155,31 @@ class TeleopCameraControlEncoders(TeleopControl):
         # Update latest encoder values
         self.latest_encoder_values = encoder_values.copy()
         
-        # Convert encoders to joint angles and sync MuJoCo
-        # NOTE: We sync MuJoCo state for accurate recording, but we do NOT reset the controller's
-        # target pose. The controller continues with velocity-based control, and IK will use the
-        # actual robot state (from encoders) as the starting point, which is correct.
+        # Convert encoders to joint angles for recording purposes
+        # IMPORTANT: We do NOT sync self.configuration.q with encoders here because it creates
+        # a feedback loop: encoder noise → IK correction → motion → more noise → jitter.
+        # Instead, we only use encoder values for:
+        # 1. Recording accurate robot state
+        # 2. Computing FK-based EE pose (separate MuJoCo instance)
+        # The main IK solver continues using its own smooth internal state.
         try:
-            robot_joint_angles, actual_position, actual_orientation_quat_wxyz = sync_robot_to_mujoco(
-                encoder_values, self.translator, self.model, self.data, self.configuration
-            )
-            
+            # Convert encoders to joint angles (without syncing main configuration)
+            robot_joint_angles = encoders_to_joint_angles(encoder_values, self.translator)
             self.latest_joint_angles_from_encoders = robot_joint_angles.copy()
-            self.latest_ee_pose_from_encoders = (actual_position.copy(), actual_orientation_quat_wxyz.copy())
             
-            # DO NOT reset controller pose - let velocity-based control continue normally
-            # The IK solver will use self.configuration.q (which is now synced with actual robot state)
-            # as the starting point, which is correct for solving IK from the true robot position.
+            # Compute EE pose from encoders using a temporary MuJoCo computation
+            # (we'll use the separate FK instance below, but this gives us the pose for recording)
+            temp_data = mujoco.MjData(self.model)
+            temp_data.qpos[:5] = robot_joint_angles[:5]
+            if len(temp_data.qpos) > 5:
+                temp_data.qpos[5] = robot_joint_angles[5]
+            mujoco.mj_forward(self.model, temp_data)
+            site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
+            actual_position = temp_data.site(site_id).xpos.copy()
+            actual_xmat = temp_data.site(site_id).xmat.reshape(3, 3)
+            actual_quat = R.from_matrix(actual_xmat).as_quat()
+            actual_orientation_quat_wxyz = np.array([actual_quat[3], actual_quat[0], actual_quat[1], actual_quat[2]])
+            self.latest_ee_pose_from_encoders = (actual_position.copy(), actual_orientation_quat_wxyz.copy())
             
             # Update separate FK-only MuJoCo instance with encoder values
             # This gives us the "ground truth" EE pose from encoders, independent of IK solver
@@ -202,51 +216,17 @@ class TeleopCameraControlEncoders(TeleopControl):
         self.encoder_poll_count += 1
         self.last_poll_timestamp = poll_start
         
-        # Debug output: print every poll for first 10, then every 10 polls, then every 50
-        if self.encoder_poll_count <= 10:
-            # Print every poll for first 10
-            print(f"[ENCODER POLL #{self.encoder_poll_count}] "
-                  f"read_time={poll_duration*1000:.2f}ms, "
-                  f"interval={interval*1000:.2f}ms ({interval_freq:.1f}Hz), "
-                  f"encoders={[encoder_values.get(mid, 'None') for mid in robot_config.motor_ids]}")
-        elif self.encoder_poll_count % 10 == 0:
-            # Print every 10 polls
-            print(f"[ENCODER POLL #{self.encoder_poll_count}] "
-                  f"read_time={poll_duration*1000:.2f}ms, "
-                  f"interval={interval*1000:.2f}ms ({interval_freq:.1f}Hz)")
-        
-        # Print detailed performance stats periodically
-        if self.encoder_poll_count % 50 == 0:
+        # Print performance stats periodically (every 100 polls)
+        if self.encoder_poll_count % 100 == 0:
             if len(self.encoder_poll_times) >= 50:
                 avg_poll_time = np.mean(self.encoder_poll_times[-50:])
-                max_poll_time = np.max(self.encoder_poll_times[-50:])
-                min_poll_time = np.min(self.encoder_poll_times[-50:])
-                
                 if len(self.encoder_poll_intervals) >= 50:
                     avg_interval = np.mean(self.encoder_poll_intervals[-50:])
-                    min_interval = np.min(self.encoder_poll_intervals[-50:])
-                    max_interval = np.max(self.encoder_poll_intervals[-50:])
                     avg_freq = 1.0 / avg_interval if avg_interval > 0 else 0
-                    min_freq = 1.0 / max_interval if max_interval > 0 else 0  # min interval = max freq
-                    max_freq = 1.0 / min_interval if min_interval > 0 else 0  # max interval = min freq
-                else:
-                    avg_interval = 0.0
-                    min_interval = 0.0
-                    max_interval = 0.0
-                    avg_freq = 0.0
-                    min_freq = 0.0
-                    max_freq = 0.0
-                
-                expected_freq = robot_config.control_frequency
-                print(f"\n[ENCODER STATS (last 50 polls)]")
-                print(f"  Read time: avg={avg_poll_time*1000:.2f}ms, min={min_poll_time*1000:.2f}ms, max={max_poll_time*1000:.2f}ms")
-                if len(self.encoder_poll_intervals) >= 50:
-                    print(f"  Interval: avg={avg_interval*1000:.2f}ms ({avg_freq:.1f}Hz), "
-                          f"min={min_interval*1000:.2f}ms ({max_freq:.1f}Hz), "
-                          f"max={max_interval*1000:.2f}ms ({min_freq:.1f}Hz)")
-                else:
-                    print(f"  Interval: (insufficient data, need {50 - len(self.encoder_poll_intervals)} more polls)")
-                print(f"  Expected frequency: {expected_freq}Hz (control loop rate)")
+                    expected_freq = robot_config.control_frequency
+                    print(f"[ENCODER POLL #{self.encoder_poll_count}] "
+                          f"avg_read={avg_poll_time*1000:.1f}ms, "
+                          f"avg_freq={avg_freq:.1f}Hz (target={expected_freq:.1f}Hz)")
                 print()
     
     def _compute_relative_pose(self, r_ref, t_ref, r_tgt, t_tgt):

@@ -22,7 +22,7 @@ from dash import Dash, dcc, html, Input, Output, State
 # --------------------------------------------------------------------------- #
 # Constants / styles
 # --------------------------------------------------------------------------- #
-DATA_DIR = Path(__file__).parent / "data/unsmoothed_data"
+DATA_DIR = Path(__file__).parent / "data/"
 
 DARK_BG = "#111111"
 DARK_FG = "#EEEEEE"
@@ -76,7 +76,16 @@ def load_trajectory(npz_path: Path):
     actions = data["actions"]
     metadata = data["metadata"].item() if "metadata" in data else {}
 
-    ee_poses_debug = data["ee_poses_debug"] if "ee_poses_debug" in data else None
+    # EE pose from IK / Mink (target/commanded) and from encoders (FK ground truth)
+    if "ee_poses_target" in data:
+        ee_poses_mink = data["ee_poses_target"]
+    elif "ee_poses_debug" in data:
+        # Backwards compatibility with older files
+        ee_poses_mink = data["ee_poses_debug"]
+    else:
+        ee_poses_mink = None
+
+    ee_poses_encoder = data["ee_pose_encoder"] if "ee_pose_encoder" in data else None
 
     aruco_keys = [
         "aruco_ee_in_world",
@@ -98,7 +107,8 @@ def load_trajectory(npz_path: Path):
         states=states,
         actions=actions,
         metadata=metadata,
-        ee_poses_debug=ee_poses_debug,
+        ee_poses_mink=ee_poses_mink,
+        ee_poses_encoder=ee_poses_encoder,
         aruco_data=aruco_data,
     )
 
@@ -153,7 +163,7 @@ def make_3d_figure(traj, title_suffix: str):
     fig.add_trace(go.Scatter3d(
         x=[0], y=[0], z=[0],
         mode="markers", name="World origin",
-        marker=dict(size=8, color="black", symbol="x"),
+        marker=dict(size=8, color="green", symbol="x"),
     ))
 
     fig.update_layout(
@@ -469,6 +479,151 @@ def make_actions_figure(traj, title_suffix: str):
     return fig
 
 
+def make_mink_encoder_figure(traj, title_suffix: str):
+    """
+    3D plot comparing Mink/IK target EE pose vs encoder-based EE pose.
+
+    - Single 3D plot
+    - Two colored lines (target vs encoder)
+    - Coordinate frames (RGB axes) drawn along each trajectory
+    """
+    timestamps = traj["timestamps"]
+    mink = traj.get("ee_poses_mink", None)
+    encoder = traj.get("ee_poses_encoder", None)
+
+    if mink is None and encoder is None:
+        return go.Figure(layout={"title": "No Mink/encoder EE pose data (ee_poses_mink / ee_pose_encoder) in this trajectory"})
+
+    fig = go.Figure()
+
+    # Ensure matching length where both are present
+    if mink is not None:
+        N_mink = mink.shape[0]
+    else:
+        N_mink = 0
+    if encoder is not None:
+        N_enc = encoder.shape[0]
+    else:
+        N_enc = 0
+
+    N = max(N_mink, N_enc)
+    if N == 0:
+        return go.Figure(layout={"title": "Mink/encoder EE pose arrays are empty"})
+
+    # Truncate to smallest available length across timestamps / poses
+    max_len = min(len(timestamps), N_mink if N_mink > 0 else len(timestamps), N_enc if N_enc > 0 else len(timestamps))
+    ts = timestamps[:max_len]
+
+    if mink is not None:
+        mink = mink[:max_len]
+    if encoder is not None:
+        encoder = encoder[:max_len]
+
+    # Plot position trajectories
+    if mink is not None:
+        pos_mink = mink[:, :3]
+        fig.add_trace(
+            go.Scatter3d(
+                x=pos_mink[:, 0],
+                y=pos_mink[:, 1],
+                z=pos_mink[:, 2],
+                mode="lines",
+                name="Target EE (Mink / IK)",
+                line=dict(color="cyan", width=4),
+                opacity=0.9,
+            )
+        )
+
+    if encoder is not None:
+        pos_enc = encoder[:, :3]
+        fig.add_trace(
+            go.Scatter3d(
+                x=pos_enc[:, 0],
+                y=pos_enc[:, 1],
+                z=pos_enc[:, 2],
+                mode="lines",
+                name="Encoder EE (FK)",
+                line=dict(color="magenta", width=4),
+                opacity=0.9,
+            )
+        )
+
+    # Draw RGB frames along each trajectory (sampled if long)
+    if mink is not None or encoder is not None:
+        num_frames = max_len
+        if num_frames > 300:
+            step = 10
+        elif num_frames > 150:
+            step = 5
+        else:
+            step = 2
+
+        # Axis size / opacity based on length
+        if num_frames > 200:
+            axis_length = 0.006
+            opacity = 0.35
+        elif num_frames > 100:
+            axis_length = 0.007
+            opacity = 0.4
+        else:
+            axis_length = 0.008
+            opacity = 0.5
+
+        for idx in range(0, num_frames, step):
+            showlegend = idx == 0
+            if mink is not None and np.all(np.isfinite(mink[idx, :7])):
+                pos = mink[idx, :3]
+                quat = mink[idx, 3:7]
+                _draw_rgb_axes(
+                    fig,
+                    pos,
+                    quat,
+                    axis_length=axis_length,
+                    name_prefix="Target",
+                    opacity=opacity,
+                    showlegend=showlegend,
+                )
+            if encoder is not None and np.all(np.isfinite(encoder[idx, :7])):
+                pos = encoder[idx, :3]
+                quat = encoder[idx, 3:7]
+                _draw_rgb_axes(
+                    fig,
+                    pos,
+                    quat,
+                    axis_length=axis_length,
+                    name_prefix="Encoder",
+                    opacity=opacity,
+                    showlegend=showlegend,
+                )
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=[0],
+            y=[0],
+            z=[0],
+            mode="markers",
+            name="World origin",
+            marker=dict(size=6, color="white", symbol="cross"),
+        )
+    )
+
+    fig.update_layout(
+        title=f"Mink vs Encoder EE Trajectory – {title_suffix}",
+        scene=dict(
+            xaxis_title="X (m)",
+            yaxis_title="Y (m)",
+            zaxis_title="Z (m)",
+            aspectmode="data",
+        ),
+        height=600,
+        margin=dict(l=0, r=0, b=0, t=40),
+        legend=dict(itemsizing="constant"),
+        template="plotly_dark",
+        paper_bgcolor=DARK_BG,
+    )
+    return fig
+
+
 def make_visibility_figure(traj, title_suffix: str):
     """Build a heatmap showing when each ArUco marker is NOT visible."""
     timestamps = traj["timestamps"]
@@ -596,12 +751,34 @@ def create_app() -> Dash:
                 ]
             ),
             html.Hr(),
-            html.H3("3D EE & Object Motion (World Frame)"),
-            dcc.Graph(id="traj-3d-graph"),
-            html.H3("EE–Object Spatial Relationship (Connectors)"),
-            dcc.Graph(id="traj-3d-connect-graph"),
-            html.H3("Smoothed Trajectory with Coordinate Frames"),
-            dcc.Graph(id="traj-smoothed-3d-graph"),
+            html.Details(
+                [
+                    html.Summary("3D EE & Object Motion (World Frame)"),
+                    dcc.Graph(id="traj-3d-graph"),
+                ],
+                open=True,
+            ),
+            html.Details(
+                [
+                    html.Summary("EE–Object Spatial Relationship (Connectors)"),
+                    dcc.Graph(id="traj-3d-connect-graph"),
+                ],
+                open=True,
+            ),
+            html.Details(
+                [
+                    html.Summary("Mink vs Encoder EE Pose (Target vs Actual)"),
+                    dcc.Graph(id="traj-mink-encoder-graph"),
+                ],
+                open=True,
+            ),
+            html.Details(
+                [
+                    html.Summary("Smoothed Trajectory with Coordinate Frames"),
+                    dcc.Graph(id="traj-smoothed-3d-graph"),
+                ],
+                open=True,
+            ),
             html.H3("Marker Visibility Over Time"),
             dcc.Graph(id="traj-vis-graph"),
             html.H3("Actions Over Time"),
@@ -676,6 +853,7 @@ def create_app() -> Dash:
         Output("traj-summary", "children"),
         Output("traj-3d-graph", "figure"),
         Output("traj-3d-connect-graph", "figure"),
+        Output("traj-mink-encoder-graph", "figure"),
         Output("traj-smoothed-3d-graph", "figure"),
         Output("traj-vis-graph", "figure"),
         Output("traj-actions-graph", "figure"),
@@ -684,7 +862,7 @@ def create_app() -> Dash:
     def update_plots(npz_path_str):
         if not npz_path_str:
             empty = go.Figure(layout={"title": "No trajectory selected"})
-            return "No trajectory selected.", empty, empty, empty, empty, empty
+            return "No trajectory selected.", empty, empty, empty, empty, empty, empty
 
         npz_path = Path(npz_path_str)
         try:
@@ -692,7 +870,7 @@ def create_app() -> Dash:
         except Exception as e:
             msg = f"Error loading {npz_path.name}: {e}"
             err = go.Figure(layout={"title": msg})
-            return msg, err, err, err, err, err
+            return msg, err, err, err, err, err, err
 
         ts = traj["timestamps"]
         metadata = traj["metadata"]
@@ -729,6 +907,7 @@ def create_app() -> Dash:
             summary,
             make_3d_figure(traj, suffix),
             make_3d_connections_figure(traj, suffix),
+            make_mink_encoder_figure(traj, suffix),
             make_smoothed_3d_figure(traj, suffix),
             make_visibility_figure(traj, suffix),
             make_actions_figure(traj, suffix),
