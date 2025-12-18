@@ -11,6 +11,14 @@ from pathlib import Path
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+import base64
+import io
+import cv2
+import tempfile
+import os
+import subprocess
+import shutil
+import atexit
 
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -101,6 +109,9 @@ def load_trajectory(npz_path: Path):
     for k in smoothed_keys:
         if k in data:
             aruco_data[k] = data[k]
+    
+    # Load camera frames if available
+    camera_frames = data["camera_frame"] if "camera_frame" in data else None
 
     return dict(
         timestamps=timestamps,
@@ -110,6 +121,7 @@ def load_trajectory(npz_path: Path):
         ee_poses_mink=ee_poses_mink,
         ee_poses_encoder=ee_poses_encoder,
         aruco_data=aruco_data,
+        camera_frames=camera_frames,
     )
 
 
@@ -120,6 +132,159 @@ def _visibility_masks(aruco_data, n):
     lost_ee = ~valid_ee
     lost_obj = ~valid_obj
     return vis, valid_ee, valid_obj, lost_ee, lost_obj
+
+
+def reencode_video_for_web(input_path, output_path=None):
+    """Re-encode video using ffmpeg to ensure web browser compatibility.
+    
+    Uses H.264 codec with web-optimized settings for maximum browser compatibility.
+    
+    Args:
+        input_path: Path to input video file
+        output_path: Path to output video file (if None, overwrites input)
+    
+    Returns:
+        Path to the re-encoded video file, or None if ffmpeg is not available or encoding fails
+    """
+    # Check if ffmpeg is available
+    if shutil.which('ffmpeg') is None:
+        print("Warning: ffmpeg not found. Video may not be web-compatible.")
+        return Path(input_path)
+    
+    if output_path is None:
+        # Create temp file for output, then replace original
+        output_path = str(Path(input_path).with_suffix('.web.mp4'))
+    
+    try:
+        # Use ffmpeg to re-encode with H.264 codec (web-compatible)
+        # -c:v libx264: Use H.264 video codec
+        # -preset medium: Balance between speed and compression
+        # -crf 23: Good quality (lower = better quality, 18-28 is typical range)
+        # -pix_fmt yuv420p: Ensures compatibility with most players
+        # -movflags +faststart: Enables streaming (metadata at beginning)
+        # -c:a copy: Copy audio if present (or disable if no audio)
+        cmd = [
+            'ffmpeg',
+            '-i', str(input_path),
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            '-movflags', '+faststart',
+            '-an',  # No audio
+            '-y',  # Overwrite output file
+            str(output_path)
+        ]
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        
+        if result.returncode == 0:
+            # Replace original with re-encoded version
+            if output_path != str(input_path):
+                Path(input_path).unlink()
+                Path(output_path).rename(input_path)
+            print(f"Video re-encoded successfully for web compatibility")
+            return Path(input_path)
+        else:
+            print(f"Warning: ffmpeg re-encoding failed: {result.stderr}")
+            return Path(input_path)
+            
+    except Exception as e:
+        print(f"Warning: Error during video re-encoding: {e}")
+        return Path(input_path)
+
+
+def frames_to_video(camera_frames, timestamps, fps=20.0, output_path=None):
+    """Convert numpy frames array to MP4 video file.
+    
+    Args:
+        camera_frames: numpy array of shape (N, H, W, 3) with BGR uint8 frames
+        timestamps: array of timestamps for each frame
+        fps: target frames per second for video
+        output_path: optional path to save video (if None, creates temp file)
+    
+    Returns:
+        Path to the created video file
+    """
+    if camera_frames is None or len(camera_frames) == 0:
+        return None
+    
+    # Create temp file if no output path provided
+    if output_path is None:
+        fd, output_path = tempfile.mkstemp(suffix='.mp4', prefix='trajectory_video_')
+        os.close(fd)
+    
+    # Get frame dimensions
+    num_frames, height, width, _ = camera_frames.shape
+    
+    # Try different codecs in order of browser compatibility
+    # H.264 (avc1) is most compatible but may not be available
+    codecs_to_try = [
+        ('avc1', 'H.264/AVC'),  # Best browser support
+        ('H264', 'H.264'),      # Alternative H.264
+        ('mp4v', 'MPEG-4'),     # Fallback
+        ('XVID', 'Xvid'),        # Another fallback
+    ]
+    
+    video_writer = None
+    used_codec = None
+    
+    for fourcc_str, codec_name in codecs_to_try:
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+        video_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        if video_writer.isOpened():
+            used_codec = codec_name
+            print(f"Using codec: {codec_name} ({fourcc_str})")
+            break
+        else:
+            video_writer.release() if video_writer else None
+    
+    if video_writer is None or not video_writer.isOpened():
+        print(f"Error: Could not open video writer for {output_path} with any codec")
+        return None
+    
+    # Write frames
+    for i in range(num_frames):
+        frame = camera_frames[i]
+        # Skip all-zero frames (failed camera reads)
+        if not np.all(frame == 0):
+            video_writer.write(frame)
+        else:
+            # Write black frame for failed reads
+            video_writer.write(np.zeros((height, width, 3), dtype=np.uint8))
+    
+    video_writer.release()
+    
+    # Verify file was created and has content
+    output_path_obj = Path(output_path)
+    if not output_path_obj.exists():
+        print(f"Error: Video file was not created at {output_path}")
+        return None
+    
+    file_size = output_path_obj.stat().st_size
+    if file_size == 0:
+        print(f"Error: Video file is empty at {output_path}")
+        output_path_obj.unlink()  # Delete empty file
+        return None
+    
+    print(f"Video file created successfully: {output_path} ({file_size / (1024*1024):.2f} MB)")
+    
+    # Re-encode for web compatibility using ffmpeg
+    print("Re-encoding video for web browser compatibility...")
+    output_path_obj = reencode_video_for_web(output_path_obj)
+    
+    if output_path_obj and output_path_obj.exists():
+        final_size = output_path_obj.stat().st_size
+        print(f"Final video file: {output_path_obj} ({final_size / (1024*1024):.2f} MB)")
+        return output_path_obj
+    else:
+        print("Warning: Re-encoding may have failed, returning original file")
+        return Path(output_path)
 
 
 def make_3d_figure(traj, title_suffix: str):
@@ -676,6 +841,91 @@ def make_visibility_figure(traj, title_suffix: str):
 def create_app() -> Dash:
     external_stylesheets = ["https://cdnjs.cloudflare.com/ajax/libs/semantic-ui/2.4.1/semantic.min.css"]
     app = Dash(__name__, external_stylesheets=external_stylesheets)
+    
+    # Create temporary videos directory in data folder (easy to manually delete)
+    DATA_DIR.mkdir(exist_ok=True)
+    videos_dir = DATA_DIR / "video_cache_temp"
+    
+    # Clean up old cache directory if it exists from previous session
+    if videos_dir.exists():
+        try:
+            shutil.rmtree(videos_dir)
+            print(f"Cleaned up old video cache directory: {videos_dir}")
+        except Exception as e:
+            print(f"Warning: Could not remove old cache directory: {e}")
+    
+    # Create fresh cache directory
+    videos_dir.mkdir(exist_ok=True)
+    print(f"Using temporary video cache directory: {videos_dir}")
+    print(f"  (You can manually delete this folder if needed: {videos_dir})")
+    
+    # Store videos_dir in app for access in callbacks
+    app.videos_dir = videos_dir
+    
+    # Simple cleanup function
+    def cleanup_videos():
+        """Remove temporary video cache directory and all its contents."""
+        try:
+            if videos_dir.exists():
+                shutil.rmtree(videos_dir)
+                print(f"Cleaned up temporary video cache: {videos_dir}")
+        except Exception as e:
+            print(f"Warning: Could not clean up video cache directory: {e}")
+    
+    # Register cleanup on exit
+    atexit.register(cleanup_videos)
+    
+    # Flask route to serve video files
+    @app.server.route("/video/<filename>")
+    def serve_video(filename):
+        from flask import send_file, abort, Response, request
+        import mimetypes
+        video_path = videos_dir / filename
+        if video_path.exists():
+            # Get file size for range requests (video seeking)
+            file_size = video_path.stat().st_size
+            range_header = request.headers.get('Range', None)
+            
+            if range_header:
+                # Handle range requests for video seeking
+                byte_start = 0
+                byte_end = file_size - 1
+                
+                # Parse range header (e.g., "bytes=0-1023")
+                match = request.headers.get('Range', '').replace('bytes=', '').split('-')
+                if match[0]:
+                    byte_start = int(match[0])
+                if len(match) > 1 and match[1]:
+                    byte_end = int(match[1])
+                
+                length = byte_end - byte_start + 1
+                
+                with open(video_path, 'rb') as f:
+                    f.seek(byte_start)
+                    data = f.read(length)
+                
+                response = Response(
+                    data,
+                    206,  # Partial Content
+                    mimetype='video/mp4',
+                    headers={
+                        'Content-Range': f'bytes {byte_start}-{byte_end}/{file_size}',
+                        'Accept-Ranges': 'bytes',
+                        'Content-Length': str(length),
+                    },
+                    direct_passthrough=False,
+                )
+                return response
+            else:
+                # Full file request
+                return send_file(
+                    str(video_path),
+                    mimetype='video/mp4',
+                    as_attachment=False,
+                    download_name=filename,
+                )
+        else:
+            abort(404)
 
     def file_options():
         return [{"label": f.name, "value": str(f)} for f in list_trajectory_files()]
@@ -783,6 +1033,62 @@ def create_app() -> Dash:
             dcc.Graph(id="traj-vis-graph"),
             html.H3("Actions Over Time"),
             dcc.Graph(id="traj-actions-graph"),
+            html.Details(
+                [
+                    html.Summary("Camera Video Playback"),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Button(
+                                        "🎬 Generate Video",
+                                        id="generate-video-btn",
+                                        n_clicks=0,
+                                        style={
+                                            "backgroundColor": "#4CAF50",
+                                            "color": "white",
+                                            "border": "none",
+                                            "padding": "0.75rem 1.5rem",
+                                            "cursor": "pointer",
+                                            "fontSize": "1rem",
+                                            "marginBottom": "1rem",
+                                        },
+                                    ),
+                                    html.Div(
+                                        id="video-generation-status",
+                                        style={"marginBottom": "1rem", "color": "#CCCCCC"},
+                                    ),
+                                    html.Video(
+                                        id="camera-video-player",
+                                        controls=True,
+                                        preload="metadata",
+                                        style={
+                                            "width": "100%",
+                                            "maxWidth": "960px",
+                                            "height": "auto",
+                                            "border": f"2px solid {BORDER}",
+                                            "backgroundColor": "#000000",
+                                            "display": "none",
+                                        },
+                                    ),
+                                    html.Div(
+                                        id="camera-video-download-link",
+                                        style={"marginTop": "0.5rem", "display": "none"},
+                                    ),
+                                    html.Div(
+                                        id="camera-video-info",
+                                        style={"marginTop": "0.5rem", "color": "#AAAAAA", "fontSize": "0.9rem"},
+                                    ),
+                                ],
+                                style={"textAlign": "center"},
+                            ),
+                        ],
+                        id="camera-video-container",
+                        style={"display": "none"},  # Hidden by default, shown if frames available
+                    ),
+                ],
+                open=False,
+            ),
         ],
     )
 
@@ -857,12 +1163,13 @@ def create_app() -> Dash:
         Output("traj-smoothed-3d-graph", "figure"),
         Output("traj-vis-graph", "figure"),
         Output("traj-actions-graph", "figure"),
+        Output("camera-video-container", "style"),
         Input("traj-file-dropdown", "value"),
     )
     def update_plots(npz_path_str):
         if not npz_path_str:
             empty = go.Figure(layout={"title": "No trajectory selected"})
-            return "No trajectory selected.", empty, empty, empty, empty, empty, empty
+            return "No trajectory selected.", empty, empty, empty, empty, empty, empty, {"display": "none"}
 
         npz_path = Path(npz_path_str)
         try:
@@ -870,7 +1177,7 @@ def create_app() -> Dash:
         except Exception as e:
             msg = f"Error loading {npz_path.name}: {e}"
             err = go.Figure(layout={"title": msg})
-            return msg, err, err, err, err, err, err
+            return msg, err, err, err, err, err, err, {"display": "none"}
 
         ts = traj["timestamps"]
         metadata = traj["metadata"]
@@ -901,8 +1208,19 @@ def create_app() -> Dash:
                 f"Percent of trajectory with ANY marker lost: {pct_any_lost:.1f}%"
             )
 
+        # Check for camera frames
+        has_frames = traj.get("camera_frames") is not None
+        if has_frames:
+            num_frames = traj["camera_frames"].shape[0]
+            summary_lines.append(f"Camera frames: {num_frames} available")
+        else:
+            num_frames = 0
+
         summary = html.Div([html.Div(line) for line in summary_lines])
         suffix = npz_path.name
+        
+        video_style = {"display": "block"} if has_frames else {"display": "none"}
+        
         return (
             summary,
             make_3d_figure(traj, suffix),
@@ -911,7 +1229,94 @@ def create_app() -> Dash:
             make_smoothed_3d_figure(traj, suffix),
             make_visibility_figure(traj, suffix),
             make_actions_figure(traj, suffix),
+            video_style,
         )
+
+    # Video generation callback
+    @app.callback(
+        Output("video-generation-status", "children"),
+        Output("camera-video-player", "src"),
+        Output("camera-video-player", "style"),
+        Output("camera-video-download-link", "children"),
+        Output("camera-video-download-link", "style"),
+        Output("camera-video-info", "children"),
+        Input("generate-video-btn", "n_clicks"),
+        State("traj-file-dropdown", "value"),
+        prevent_initial_call=True,
+    )
+    def generate_video(n_clicks, npz_path_str):
+        if not npz_path_str or n_clicks == 0:
+            return "", "", {"display": "none"}, "", {"display": "none"}, ""
+        
+        try:
+            npz_path = Path(npz_path_str)
+            traj = load_trajectory(npz_path)
+            camera_frames = traj.get("camera_frames")
+            timestamps = traj["timestamps"]
+            
+            if camera_frames is None or len(camera_frames) == 0:
+                return html.Div("No camera frames available in this trajectory.", style={"color": "#FF6B6B"}), "", {"display": "none"}, "", {"display": "none"}, ""
+            
+            # Calculate FPS from timestamps
+            if len(timestamps) > 1:
+                duration = timestamps[-1] - timestamps[0]
+                fps = (len(timestamps) - 1) / duration if duration > 0 else 20.0
+            else:
+                fps = 20.0
+            
+            # Generate video file in temporary cache directory
+            videos_dir = app.videos_dir
+            videos_dir.mkdir(exist_ok=True)
+            
+            # Create unique filename based on trajectory file
+            traj_name = Path(npz_path_str).stem
+            video_filename = f"{traj_name}_video.mp4"
+            video_path = videos_dir / video_filename
+            
+            status_msg = html.Div("Generating video...", style={"color": "#FFA500"})
+            
+            video_path = frames_to_video(camera_frames, timestamps, fps=fps, output_path=video_path)
+            
+            if video_path is None or not video_path.exists():
+                return html.Div("Error generating video file.", style={"color": "#FF6B6B"}), "", {"display": "none"}, ""
+            
+            # Get video file size
+            video_size_mb = video_path.stat().st_size / (1024 * 1024)
+            num_frames = len(camera_frames)
+            height, width = camera_frames.shape[1], camera_frames.shape[2]
+            
+            # Use Flask route to serve the video
+            video_url = f"/video/{video_path.name}"
+            
+            info_text = f"Video: {num_frames} frames @ {fps:.1f} fps | Resolution: {width}x{height} | Size: {video_size_mb:.2f} MB"
+            success_msg = html.Div(
+                f"✓ Video generated successfully! ({num_frames} frames, {video_size_mb:.2f} MB)",
+                style={"color": "#4CAF50"}
+            )
+            
+            # Create download link
+            download_link = html.A(
+                "📥 Download Video",
+                href=video_url,
+                download=video_path.name,
+                style={
+                    "color": "#4CAF50",
+                    "textDecoration": "underline",
+                    "marginLeft": "1rem",
+                },
+            )
+            
+            return success_msg, video_url, {"display": "block"}, download_link, {"display": "block"}, info_text
+            
+        except Exception as e:
+            import traceback
+            error_msg = html.Div(
+                [
+                    html.Div(f"Error: {str(e)}", style={"color": "#FF6B6B"}),
+                    html.Div(f"Details: {traceback.format_exc()}", style={"color": "#888", "fontSize": "0.8rem", "marginTop": "0.5rem"}),
+                ]
+            )
+            return error_msg, "", {"display": "none"}, "", {"display": "none"}, ""
 
     return app
 
@@ -927,8 +1332,26 @@ def main():
         print("  -", f)
 
     app = create_app()
-    # Dash 3.x: use app.run instead of deprecated app.run_server
-    app.run(debug=False)
+    print("\nNote: Videos are stored in a temporary cache directory at:")
+    print(f"      {app.videos_dir}")
+    print("      This will be automatically cleaned up on shutdown (Ctrl+C).\n")
+    
+    try:
+        # Dash 3.x: use app.run instead of deprecated app.run_server
+        app.run(debug=False)
+    except KeyboardInterrupt:
+        print("\n\nShutting down server...")
+    except Exception as e:
+        print(f"\n\nError: {e}")
+    finally:
+        # Ensure cleanup happens
+        if hasattr(app, 'videos_dir') and app.videos_dir.exists():
+            try:
+                shutil.rmtree(app.videos_dir)
+                print(f"Cleaned up temporary video cache: {app.videos_dir}")
+            except Exception as e:
+                print(f"Warning: Could not clean up video cache: {e}")
+                print(f"  You can manually delete: {app.videos_dir}")
 
 
 if __name__ == "__main__":

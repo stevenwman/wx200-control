@@ -1,17 +1,22 @@
 """
 Teleop control with ArUco marker tracking and true encoder state polling.
 
-This version polls actual robot encoder values at high frequency (50Hz+),
+This version polls actual robot encoder values at high frequency,
 uses them to sync MuJoCo state, and records encoder values in the trajectory.
 This ensures we're recording the true robot state rather than relying on MuJoCo estimates.
+
+Updated with selective profiling - tracks performance but only prints warnings when issues detected.
+Based on wx200_robot_profile_camera.py but optimized for data collection with minimal verbosity.
 """
 import cv2
 import numpy as np
 import argparse
 import time
+import threading
 import mujoco
 import mink
 from scipy.spatial.transform import Rotation as R
+from collections import deque
 
 from robot_control.robot_config import robot_config
 from wx200_robot_teleop_control import TeleopControl, save_trajectory
@@ -21,15 +26,178 @@ from robot_control.robot_joint_to_motor import JointToMotorTranslator, encoders_
 # Shorter axes for visualization to reduce chance of going off-frame (and warnings)
 AXIS_LENGTH = MARKER_SIZE * robot_config.aruco_axis_length_scale
 
+
+class LightweightProfiler:
+    """
+    Lightweight profiler that tracks performance but only prints warnings when thresholds exceeded.
+    
+    Tracks timing statistics but doesn't flood console with periodic reports.
+    Only alerts when issues detected (excess polling time, control loop failures, etc.)
+    """
+    
+    def __init__(self):
+        """Initialize profiler with tracking but minimal output."""
+        self.window_size = robot_config.profiler_window_size
+        
+        # Track control loop iteration timing (for detecting failures)
+        self.control_loop_iteration_times = deque(maxlen=self.window_size)
+        self.control_loop_intervals = deque(maxlen=self.window_size)
+        self.last_control_loop_timestamp = None
+        self.total_iterations = 0
+        self.missed_deadlines = 0
+        self.expected_dt = 1.0 / robot_config.control_frequency
+        self.deadline_threshold = robot_config.deadline_threshold_factor
+        self._blocking_iteration_count = 0
+        
+        # Track camera processing time (for detecting issues)
+        self.total_camera_time = deque(maxlen=self.window_size)
+        self.camera_read_fail_count = 0
+        self.camera_read_count = 0
+        
+        # Warning tracking (prevent spam)
+        self._last_warning_time = {}
+        self._warning_cooldown = 5.0  # Only warn once every 5 seconds per issue type
+    
+    def record_control_loop_iteration(self, elapsed_time):
+        """Record control loop iteration timing and check for issues."""
+        now = time.perf_counter()
+        
+        # Filter out blocking operations (save_trajectory, etc.)
+        if elapsed_time < robot_config.blocking_outlier_threshold_outer_loop:
+            self.control_loop_iteration_times.append(elapsed_time)
+            self.total_iterations += 1
+            
+            # Check for missed deadline
+            if elapsed_time > (self.expected_dt * self.deadline_threshold):
+                self.missed_deadlines += 1
+                self._check_and_warn_control_loop()
+        else:
+            self._blocking_iteration_count += 1
+            self.total_iterations += 1
+        
+        # Track interval between iterations
+        if self.last_control_loop_timestamp is not None:
+            interval = now - self.last_control_loop_timestamp
+            if interval < robot_config.blocking_interval_threshold:
+                self.control_loop_intervals.append(interval)
+        self.last_control_loop_timestamp = now
+    
+    def record_total_camera_time(self, elapsed_time, read_success):
+        """Record camera processing time and check for issues."""
+        self.total_camera_time.append(elapsed_time)
+        self.camera_read_count += 1
+        if not read_success:
+            self.camera_read_fail_count += 1
+            self._check_and_warn_camera()
+    
+    def _check_and_warn_control_loop(self):
+        """Check control loop performance and warn if issues detected."""
+        if not robot_config.warning_only_mode:
+            return
+        
+        now = time.perf_counter()
+        last_warn = self._last_warning_time.get('control_loop', 0)
+        if now - last_warn < self._warning_cooldown:
+            return
+        
+        if len(self.control_loop_iteration_times) < 50:
+            return
+        
+        stats = self._get_control_loop_stats()
+        deadline_ms = stats['deadline_threshold_ms']
+        
+        # Warn if missed deadline rate is high
+        if stats['missed_deadline_rate'] >= robot_config.missed_deadline_warning_threshold:
+            print(f"\n⚠️  CONTROL LOOP WARNING: {stats['missed_deadline_rate']:.1f}% missed deadlines "
+                  f"(threshold: {deadline_ms:.1f}ms, actual: {stats['avg_iteration_time']:.1f}ms)")
+            self._last_warning_time['control_loop'] = now
+        
+        # Warn if frequency is too low
+        if stats['actual_frequency'] > 0 and stats['target_frequency'] > 0:
+            freq_ratio = stats['actual_frequency'] / stats['target_frequency']
+            if freq_ratio < 0.90:  # Running at <90% of target
+                print(f"\n⚠️  CONTROL LOOP WARNING: Frequency {stats['actual_frequency']:.2f}Hz "
+                      f"(target: {stats['target_frequency']:.2f}Hz, {freq_ratio*100:.1f}% of target)")
+                self._last_warning_time['control_loop'] = now
+    
+    def _check_and_warn_camera(self):
+        """Check camera performance and warn if issues detected."""
+        if not robot_config.warning_only_mode:
+            return
+        
+        now = time.perf_counter()
+        last_warn = self._last_warning_time.get('camera', 0)
+        if now - last_warn < self._warning_cooldown:
+            return
+        
+        if len(self.total_camera_time) < 50:
+            return
+        
+        # Warn on camera read failures
+        if self.camera_read_count > 0:
+            failure_rate = (self.camera_read_fail_count / self.camera_read_count) * 100
+            if failure_rate > 5.0:  # >5% failure rate
+                print(f"\n⚠️  CAMERA WARNING: {failure_rate:.1f}% read failures "
+                      f"({self.camera_read_fail_count}/{self.camera_read_count} failed)")
+                self._last_warning_time['camera'] = now
+        
+        # Warn on excessive camera processing time
+        times_ms = [t * 1000 for t in list(self.total_camera_time)[-50:]]
+        if times_ms:
+            p95_time = np.percentile(times_ms, 95)
+            deadline_ms = (self.expected_dt * self.deadline_threshold) * 1000
+            
+            if p95_time > deadline_ms * robot_config.camera_assessment_threshold:
+                print(f"\n⚠️  CAMERA WARNING: Processing time {p95_time:.1f}ms exceeds threshold "
+                      f"({deadline_ms * robot_config.camera_assessment_threshold:.1f}ms)")
+                self._last_warning_time['camera'] = now
+    
+    def _get_control_loop_stats(self):
+        """Get control loop statistics."""
+        if not self.control_loop_iteration_times:
+            return {}
+        
+        times_ms = [t * 1000 for t in self.control_loop_iteration_times]
+        intervals_ms = [t * 1000 for t in self.control_loop_intervals] if self.control_loop_intervals else []
+        
+        stats = {
+            'avg_iteration_time': np.mean(times_ms),
+            'p95_iteration_time': np.percentile(times_ms, 95) if len(times_ms) > 1 else times_ms[0],
+            'missed_deadline_rate': (self.missed_deadlines / max(self.total_iterations, 1)) * 100,
+            'deadline_threshold_ms': (self.expected_dt * self.deadline_threshold) * 1000,
+            'target_frequency': robot_config.control_frequency,
+        }
+        
+        if intervals_ms:
+            avg_interval = np.mean(intervals_ms) / 1000.0
+            stats['actual_frequency'] = 1.0 / avg_interval if avg_interval > 0 else 0
+        else:
+            stats['actual_frequency'] = 0
+        
+        return stats
+    
+    def get_final_stats(self):
+        """Get final statistics for shutdown reporting."""
+        return {
+            'control_loop': self._get_control_loop_stats(),
+            'total_iterations': self.total_iterations,
+            'missed_deadlines': self.missed_deadlines,
+            'blocking_operations': self._blocking_iteration_count,
+            'camera_read_failures': self.camera_read_fail_count,
+            'camera_read_count': self.camera_read_count,
+        }
+
+
 class TeleopCameraControlEncoders(TeleopControl):
     """
     Teleop control that polls true encoder values and records them.
     
-    Key differences from base TeleopCameraControl:
-    - Polls actual robot encoders at 50Hz+ using GroupSyncRead
-    - Uses encoder values to sync MuJoCo state before solving IK
+    Key features:
+    - Polls actual robot encoders using GroupSyncRead
+    - Uses encoder values to compute ground-truth FK (separate MuJoCo instance)
     - Records encoder values in trajectory
     - Records joint angles derived from encoders (not MuJoCo estimates)
+    - Lightweight profiling with warning-only output mode
     
     Tracks:
     - ID 0: World/Base Frame
@@ -54,32 +222,44 @@ class TeleopCameraControlEncoders(TeleopControl):
         self.dist_coeffs = None
         
         # Latest detections
-        self.latest_object_pose = None # (rvec, tvec)
-        self.latest_world_pose = None  # (rvec, tvec)
-        self.latest_gripper_pose = None # (rvec, tvec)
+        self.latest_object_pose = None
+        self.latest_world_pose = None
+        self.latest_gripper_pose = None
         
-        # Latest encoder state (updated by polling)
-        self.latest_encoder_values = {}  # {motor_id: encoder_position}
-        self.latest_joint_angles_from_encoders = None  # np.array([q0-q4, gripper])
-        self.latest_ee_pose_from_encoders = None  # (position, quat_wxyz)
+        # Latest encoder state (updated by encoder polling)
+        self.latest_encoder_values = {}
+        self.latest_joint_angles_from_encoders = None
+        self.latest_ee_pose_from_encoders = None
+        
+        # Latest ArUco observations (updated every outer loop iteration, for gym env get_obs)
+        self.latest_aruco_obs = {
+            'aruco_ee_in_world': np.zeros(7),
+            'aruco_object_in_world': np.zeros(7),
+            'aruco_ee_in_object': np.zeros(7),
+            'aruco_object_in_ee': np.zeros(7),
+            'aruco_visibility': np.zeros(3)
+        }
         
         # Separate MuJoCo instance for encoder-based forward kinematics only
-        # This is independent from the IK solver's MuJoCo instance
         self.encoder_fk_model = None
         self.encoder_fk_data = None
         self.encoder_fk_configuration = None
-        self.latest_ee_pose_from_encoders_fk = None  # EE pose from encoder-only FK model
+        self.latest_ee_pose_from_encoders_fk = None
         
         # Performance tracking
         self.encoder_poll_times = []
-        self.encoder_poll_intervals = []  # Time between polls
+        self.encoder_poll_intervals = []
         self.encoder_poll_count = 0
         self.last_poll_timestamp = None
+        self.encoder_lock_wait_times = []
+        self.encoder_lock_contention_count = 0
+        
+        # Lightweight profiler (warning-only mode)
+        self.profiler = LightweightProfiler()
         
         # Visualization
         self.show_video = True
-        # Draw axes by default, but with reduced length (AXIS_LENGTH) to reduce warnings.
-        self.show_axes = True  # Set to False if you want markers only.
+        self.show_axes = True
         
     def on_ready(self):
         """Initialize camera and estimator."""
@@ -102,7 +282,6 @@ class TeleopCameraControlEncoders(TeleopControl):
             print("ℹ️  Note: GStreamer not found. Using OpenCV fallback.")
         
         try:
-            # Camera factory handles GStreamer vs OpenCV selection
             self.camera = Camera(device=self.camera_id, width=self.width, height=self.height, fps=self.fps)
             self.camera.start()
             
@@ -121,94 +300,104 @@ class TeleopCameraControlEncoders(TeleopControl):
             
         print("="*60 + "\n")
     
-    def _poll_encoders(self):
+    def _poll_encoders(self, outer_loop_start_time=None):
         """
         Poll encoder values from robot hardware using fast bulk read.
         
-        Updates:
-        - self.latest_encoder_values
-        - self.latest_joint_angles_from_encoders
-        - self.latest_ee_pose_from_encoders (via MuJoCo sync)
+        Uses opportunistic read strategy: skip if insufficient time remaining
+        in outer loop period to avoid blocking.
         """
         poll_start = time.perf_counter()
         
+        # Opportunistic read strategy
+        if outer_loop_start_time is not None:
+            outer_loop_period = 1.0 / robot_config.control_frequency
+            time_elapsed = poll_start - outer_loop_start_time
+            time_remaining = outer_loop_period - time_elapsed
+            
+            # Safe margin: need at least 30ms to attempt read
+            if time_remaining < 0.030:  # 30ms
+                if not hasattr(self, '_skipped_reads_count'):
+                    self._skipped_reads_count = 0
+                self._skipped_reads_count += 1
+                # Only warn if skipping becomes frequent
+                if self._skipped_reads_count % 100 == 0 and robot_config.warning_only_mode:
+                    print(f"⚠️  Skipped {self._skipped_reads_count} encoder reads (insufficient time)")
+                return
+        
         # Track interval since last poll
-        # Only include intervals that are reasonable (< 1 second) to exclude gaps between recording sessions
         if self.last_poll_timestamp is not None:
             interval = poll_start - self.last_poll_timestamp
-            # Only track intervals < 1 second (reasonable for 20Hz polling)
-            # Larger intervals indicate gaps between recording sessions
-            if interval < 1.0:
+            if interval < 1.0:  # Only track reasonable intervals
                 self.encoder_poll_intervals.append(interval)
-            interval_freq = 1.0 / interval if interval > 0 else 0
         else:
             interval = 0.0
-            interval_freq = 0.0
         
-        # Read encoders using bulk read (GroupSyncRead) for speed
-        encoder_values = self.robot_driver.read_all_encoders(
-            max_retries=1,  # Fast retry (bulk read should be reliable)
-            retry_delay=0.01,
-            use_bulk_read=True  # Use GroupSyncRead for speed
-        )
+        # Read encoders using bulk read
+        if hasattr(self, '_driver_lock') and self._driver_lock is not None:
+            lock_acquire_start = time.perf_counter()
+            with self._driver_lock:
+                lock_acquire_time = time.perf_counter() - lock_acquire_start
+                if lock_acquire_time > robot_config.lock_wait_threshold:
+                    self.encoder_lock_wait_times.append(lock_acquire_time)
+                    self.encoder_lock_contention_count += 1
+                    if len(self.encoder_lock_wait_times) > robot_config.max_profiling_samples:
+                        self.encoder_lock_wait_times.pop(0)
+                encoder_values = self.robot_driver.read_all_encoders(
+                    max_retries=1, retry_delay=0.01, use_bulk_read=True
+                )
+        else:
+            encoder_values = self.robot_driver.read_all_encoders(
+                max_retries=1, retry_delay=0.01, use_bulk_read=True
+            )
         
-        # Update latest encoder values
-        self.latest_encoder_values = encoder_values.copy()
-        
-        # Convert encoders to joint angles for recording purposes
-        # IMPORTANT: We do NOT sync self.configuration.q with encoders here because it creates
-        # a feedback loop: encoder noise → IK correction → motion → more noise → jitter.
-        # Instead, we only use encoder values for:
-        # 1. Recording accurate robot state
-        # 2. Computing FK-based EE pose (separate MuJoCo instance)
-        # The main IK solver continues using its own smooth internal state.
-        try:
-            # Convert encoders to joint angles (without syncing main configuration)
-            robot_joint_angles = encoders_to_joint_angles(encoder_values, self.translator)
-            self.latest_joint_angles_from_encoders = robot_joint_angles.copy()
+        # Update encoder state
+        if encoder_values:
+            self.latest_encoder_values = encoder_values.copy()
             
-            # Compute EE pose from encoders using a temporary MuJoCo computation
-            # (we'll use the separate FK instance below, but this gives us the pose for recording)
-            temp_data = mujoco.MjData(self.model)
-            temp_data.qpos[:5] = robot_joint_angles[:5]
-            if len(temp_data.qpos) > 5:
-                temp_data.qpos[5] = robot_joint_angles[5]
-            mujoco.mj_forward(self.model, temp_data)
-            site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
-            actual_position = temp_data.site(site_id).xpos.copy()
-            actual_xmat = temp_data.site(site_id).xmat.reshape(3, 3)
-            actual_quat = R.from_matrix(actual_xmat).as_quat()
-            actual_orientation_quat_wxyz = np.array([actual_quat[3], actual_quat[0], actual_quat[1], actual_quat[2]])
-            self.latest_ee_pose_from_encoders = (actual_position.copy(), actual_orientation_quat_wxyz.copy())
-            
-            # Update separate FK-only MuJoCo instance with encoder values
-            # This gives us the "ground truth" EE pose from encoders, independent of IK solver
-            if self.encoder_fk_model is not None:
-                # Convert encoders to joint angles (same as above)
-                # Update FK-only model with encoder-based joint angles
-                self.encoder_fk_data.qpos[:5] = robot_joint_angles[:5]
-                if len(self.encoder_fk_data.qpos) > 5:
-                    self.encoder_fk_data.qpos[5] = robot_joint_angles[5]
+            try:
+                robot_joint_angles = encoders_to_joint_angles(encoder_values, self.translator)
+                self.latest_joint_angles_from_encoders = robot_joint_angles.copy()
                 
-                # Compute forward kinematics
-                mujoco.mj_forward(self.encoder_fk_model, self.encoder_fk_data)
+                # Compute EE pose from encoders using temporary MuJoCo computation
+                temp_data = mujoco.MjData(self.model)
+                temp_data.qpos[:5] = robot_joint_angles[:5]
+                if len(temp_data.qpos) > 5:
+                    temp_data.qpos[5] = robot_joint_angles[5]
+                mujoco.mj_forward(self.model, temp_data)
+                site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
+                actual_position = temp_data.site(site_id).xpos.copy()
+                actual_xmat = temp_data.site(site_id).xmat.reshape(3, 3)
+                actual_quat = R.from_matrix(actual_xmat).as_quat()
+                actual_orientation_quat_wxyz = np.array([actual_quat[3], actual_quat[0], actual_quat[1], actual_quat[2]])
+                self.latest_ee_pose_from_encoders = (actual_position.copy(), actual_orientation_quat_wxyz.copy())
                 
-                # Update configuration
-                self.encoder_fk_configuration.update(self.encoder_fk_data.qpos)
+                # Update separate FK-only MuJoCo instance
+                if self.encoder_fk_model is not None:
+                    self.encoder_fk_data.qpos[:5] = robot_joint_angles[:5]
+                    if len(self.encoder_fk_data.qpos) > 5:
+                        self.encoder_fk_data.qpos[5] = robot_joint_angles[5]
+                    
+                    mujoco.mj_forward(self.encoder_fk_model, self.encoder_fk_data)
+                    self.encoder_fk_configuration.update(self.encoder_fk_data.qpos)
+                    
+                    site_id = mujoco.mj_name2id(self.encoder_fk_model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
+                    fk_position = self.encoder_fk_data.site(site_id).xpos.copy()
+                    fk_xmat = self.encoder_fk_data.site(site_id).xmat.reshape(3, 3)
+                    fk_quat = R.from_matrix(fk_xmat).as_quat()
+                    fk_orientation_quat_wxyz = np.array([fk_quat[3], fk_quat[0], fk_quat[1], fk_quat[2]])
+                    
+                    self.latest_ee_pose_from_encoders_fk = (fk_position.copy(), fk_orientation_quat_wxyz.copy())
                 
-                # Get EE pose from FK-only model
-                site_id = mujoco.mj_name2id(self.encoder_fk_model, mujoco.mjtObj.mjOBJ_SITE, "attachment_site")
-                fk_position = self.encoder_fk_data.site(site_id).xpos.copy()
-                fk_xmat = self.encoder_fk_data.site(site_id).xmat.reshape(3, 3)
-                fk_quat = R.from_matrix(fk_xmat).as_quat()
-                fk_orientation_quat_wxyz = np.array([fk_quat[3], fk_quat[0], fk_quat[1], fk_quat[2]])
-                
-                self.latest_ee_pose_from_encoders_fk = (fk_position.copy(), fk_orientation_quat_wxyz.copy())
-            
-        except Exception as e:
-            # If sync fails, log warning but continue
-            print(f"⚠️  Warning: Failed to sync encoders to MuJoCo: {e}")
-            # Keep previous values
+            except Exception as e:
+                if robot_config.warning_only_mode:
+                    # Only print warnings occasionally to avoid spam
+                    if not hasattr(self, '_last_encoder_error_time'):
+                        self._last_encoder_error_time = 0
+                    now = time.perf_counter()
+                    if now - self._last_encoder_error_time > 5.0:
+                        print(f"⚠️  Warning: Failed to sync encoders to MuJoCo: {e}")
+                        self._last_encoder_error_time = now
         
         # Track performance
         poll_duration = time.perf_counter() - poll_start
@@ -216,62 +405,88 @@ class TeleopCameraControlEncoders(TeleopControl):
         self.encoder_poll_count += 1
         self.last_poll_timestamp = poll_start
         
-        # Print performance stats periodically (every 100 polls)
-        if self.encoder_poll_count % 100 == 0:
+        # Print encoder poll stats periodically (only if interval configured and not in warning-only mode)
+        if (robot_config.encoder_poll_stats_interval > 0 and 
+            not robot_config.warning_only_mode and
+            self.encoder_poll_count % robot_config.encoder_poll_stats_interval == 0):
             if len(self.encoder_poll_times) >= 50:
                 avg_poll_time = np.mean(self.encoder_poll_times[-50:])
                 if len(self.encoder_poll_intervals) >= 50:
                     avg_interval = np.mean(self.encoder_poll_intervals[-50:])
                     avg_freq = 1.0 / avg_interval if avg_interval > 0 else 0
                     expected_freq = robot_config.control_frequency
+                    
+                    lock_info = ""
+                    if len(self.encoder_lock_wait_times) > 0:
+                        recent_waits = self.encoder_lock_wait_times[-50:] if len(self.encoder_lock_wait_times) >= 50 else self.encoder_lock_wait_times
+                        if recent_waits:
+                            avg_wait = np.mean(recent_waits)
+                            max_wait = np.max(recent_waits)
+                            contention_pct = (len(recent_waits) / 50) * 100 if len(recent_waits) < 50 else 100
+                            lock_info = f" | outer_waits: avg={avg_wait*1000:.1f}ms, max={max_wait*1000:.1f}ms ({contention_pct:.0f}% of reads)"
+                    
                     print(f"[ENCODER POLL #{self.encoder_poll_count}] "
                           f"avg_read={avg_poll_time*1000:.1f}ms, "
-                          f"avg_freq={avg_freq:.1f}Hz (target={expected_freq:.1f}Hz)")
-                print()
+                          f"avg_freq={avg_freq:.1f}Hz (target={expected_freq:.1f}Hz){lock_info}")
+        
+        # Warn on excessive encoder read times
+        if robot_config.warning_only_mode and len(self.encoder_poll_times) >= 50:
+            recent_times = self.encoder_poll_times[-50:]
+            avg_time = np.mean(recent_times)
+            max_time = np.max(recent_times)
+            # Warn if average > 15ms or max > 20ms (indicates potential issues)
+            if avg_time > 0.015 or max_time > 0.020:
+                if not hasattr(self, '_last_encoder_warning_time'):
+                    self._last_encoder_warning_time = 0
+                now = time.perf_counter()
+                if now - self._last_encoder_warning_time > 5.0:
+                    print(f"⚠️  ENCODER WARNING: Slow reads detected (avg={avg_time*1000:.1f}ms, max={max_time*1000:.1f}ms)")
+                    self._last_encoder_warning_time = now
     
     def _compute_relative_pose(self, r_ref, t_ref, r_tgt, t_tgt):
         """Compute target pose relative to reference frame. Returns (pos, quat_wxyz) or (zeros, zeros)."""
         if r_ref is None or t_ref is None or r_tgt is None or t_tgt is None:
-            return np.zeros(3), np.array([1., 0., 0., 0.]) # Identity quaternion (w, x, y, z)
+            return np.zeros(3), np.array([1., 0., 0., 0.])
             
-        # Get relative pose: Target in Reference
         r_rel, t_rel = self.estimator.get_relative_pose(r_ref, t_ref, r_tgt, t_tgt)
-        
-        # Convert rotation to quaternion (wxyz)
         R_rel, _ = cv2.Rodrigues(r_rel)
         quat_xyzw = R.from_matrix(R_rel).as_quat()
         quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
         
         return t_rel.flatten(), quat_wxyz
     
-    
-    def on_control_loop_iteration(self, velocity_world, angular_velocity_world, gripper_target, dt):
-        """Read camera, detect markers, poll encoders, and update trajectory."""
+    def on_control_loop_iteration(self, velocity_world, angular_velocity_world, gripper_target, dt, outer_loop_start_time=None):
+        """Read camera, detect markers, poll encoders (always), and update trajectory if recording."""
+        iteration_start = time.perf_counter()
+        camera_start = time.perf_counter()
         
-        # Handle GUI commands (from parent class)
+        # Handle GUI commands
         self._handle_control_input()
         
-        # Initialize storage for all composite observations
-        # Formats: 7D poses [x, y, z, qw, qx, qy, qz]
-        obs = {
-            'aruco_ee_in_world': np.zeros(7),      # ID 3 in ID 0
-            'aruco_object_in_world': np.zeros(7),  # ID 2 in ID 0
-            'aruco_ee_in_object': np.zeros(7),     # ID 3 in ID 2
-            'aruco_object_in_ee': np.zeros(7),     # ID 2 in ID 3
-            'aruco_visibility': np.zeros(3)        # [World(0), Object(2), Gripper(3)]
-        }
+        # Poll encoders
+        self._poll_encoders(outer_loop_start_time=outer_loop_start_time)
         
-        # Alias for backward compatibility (maps to object_in_world)
+        # Initialize storage for observations
+        obs = {
+            'aruco_ee_in_world': np.zeros(7),
+            'aruco_object_in_world': np.zeros(7),
+            'aruco_ee_in_object': np.zeros(7),
+            'aruco_object_in_ee': np.zeros(7),
+            'aruco_visibility': np.zeros(3)
+        }
         object_pose_data = np.zeros(7)
         object_visible = 0.0
         
+        # Camera processing
         if self.camera:
             ret, frame = self.camera.read()
+            camera_read_time = time.perf_counter() - camera_start
+            
             if ret:
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 corners, ids, _ = self.detector.detectMarkers(gray)
                 
-                # Process tags using configured IDs
+                # Process tags
                 r_world, t_world = self.estimator.process_tag(
                     corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_world_id
                 )
@@ -282,7 +497,7 @@ class TeleopCameraControlEncoders(TeleopControl):
                     corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_ee_id
                 )
                 
-                # Update visibility flags based on actual detections (not just held poses)
+                # Update visibility flags
                 world_visible = False
                 object_visible = False
                 ee_visible = False
@@ -291,7 +506,7 @@ class TeleopCameraControlEncoders(TeleopControl):
                     world_visible = np.any(ids_arr == robot_config.aruco_world_id)
                     object_visible = np.any(ids_arr == robot_config.aruco_object_id)
                     ee_visible = np.any(ids_arr == robot_config.aruco_ee_id)
-
+                
                 obs['aruco_visibility'][0] = 1.0 if world_visible else 0.0
                 obs['aruco_visibility'][1] = 1.0 if object_visible else 0.0
                 obs['aruco_visibility'][2] = 1.0 if ee_visible else 0.0
@@ -308,62 +523,50 @@ class TeleopCameraControlEncoders(TeleopControl):
                         if r_ee is not None:
                             cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_ee, t_ee, AXIS_LENGTH)
                     
-                    # Resize for display (configurable preview size)
                     disp = cv2.resize(
                         frame,
                         (robot_config.camera_width // 2, robot_config.camera_height // 2)
                     )
                     cv2.imshow('Robot Camera View', disp)
                     cv2.waitKey(1)
-
-                # Compute Composite Observations
                 
-                # 1. EE (3) relative to World (0)
+                # Compute relative poses
                 pos, quat = self._compute_relative_pose(r_world, t_world, r_ee, t_ee)
                 obs['aruco_ee_in_world'] = np.concatenate([pos, quat])
-
-                # 2. Object (2) relative to World (0)
+                
                 pos, quat = self._compute_relative_pose(r_world, t_world, r_obj, t_obj)
                 obs['aruco_object_in_world'] = np.concatenate([pos, quat])
                 
-                # Backward compatibility
                 if obs['aruco_visibility'][0] and obs['aruco_visibility'][1]:
                     object_pose_data = obs['aruco_object_in_world']
                     object_visible = 1.0
-
-                # 3. EE (3) relative to Object (2)
+                
                 pos, quat = self._compute_relative_pose(r_obj, t_obj, r_ee, t_ee)
                 obs['aruco_ee_in_object'] = np.concatenate([pos, quat])
-
-                # 4. Object (2) relative to EE (3)
+                
                 pos, quat = self._compute_relative_pose(r_ee, t_ee, r_obj, t_obj)
                 obs['aruco_object_in_ee'] = np.concatenate([pos, quat])
         
-        # 2. Robot Recording with encoder-based state
-        # Note: We override the base class recording to use encoder-based state instead of MuJoCo estimates
+        # Record total camera processing time
+        total_camera_time = time.perf_counter() - camera_start
+        self.profiler.record_total_camera_time(total_camera_time, ret if self.camera else False)
+        
+        # Store latest observations
+        self.latest_aruco_obs = {k: v.copy() for k, v in obs.items()}
+        
+        # Recording logic
         if self.is_recording:
             if self.recording_start_time is None:
                 self.recording_start_time = time.perf_counter()
             
-            # IMPORTANT: Capture IK solver's target EE pose BEFORE syncing with encoders
-            # This represents the target/commanded pose from the IK solver (what we're trying to achieve)
-            # After we sync with encoders, this state will be overwritten
             ik_ee_position, ik_ee_orientation_quat_wxyz = self._get_current_ee_pose()
             ee_pose_target = np.concatenate([ik_ee_position, ik_ee_orientation_quat_wxyz])
             
-            # NOW poll encoders and sync MuJoCo (this will overwrite self.configuration.q)
-            # This ensures we record the true robot state, not MuJoCo estimates
-            self._poll_encoders()
-            
-            # Use encoder-derived state instead of MuJoCo estimates
             if self.latest_joint_angles_from_encoders is not None:
-                # State: joint angles from encoders (5 joints + gripper)
                 state = self.latest_joint_angles_from_encoders.copy()
             else:
-                # Fallback to MuJoCo if encoder sync failed
                 state = np.concatenate([self.configuration.q[:5], [gripper_target]])
             
-            # Action: velocity commands + gripper
             action = np.concatenate([velocity_world, angular_velocity_world, [gripper_target]])
             
             self.trajectory.append({
@@ -373,62 +576,56 @@ class TeleopCameraControlEncoders(TeleopControl):
                 'ee_pose_target': ee_pose_target.copy()
             })
             
-            # Augment with encoder values and ArUco observations
             if self.trajectory:
                 current_step = self.trajectory[-1]
                 
-                # Store encoder values (raw hardware readings)
                 encoder_array = np.array([
                     self.latest_encoder_values.get(mid, 0) 
                     for mid in robot_config.motor_ids
                 ])
                 current_step['encoder_values'] = encoder_array
                 
-                # Store encoder-based FK EE pose (from separate FK-only MuJoCo instance)
-                # This is the "ground truth" EE pose computed purely from encoder readings
-                # Format: [x, y, z, qw, qx, qy, qz]
                 if self.latest_ee_pose_from_encoders_fk is not None:
                     fk_position, fk_orientation = self.latest_ee_pose_from_encoders_fk
                     ee_pose_encoder = np.concatenate([fk_position, fk_orientation])
                     current_step['ee_pose_encoder'] = ee_pose_encoder.copy()
                 else:
-                    # Fallback: use zeros if FK not available
                     current_step['ee_pose_encoder'] = np.zeros(7)
                 
-                # Store backward compatible fields
                 current_step['object_pose'] = object_pose_data
                 current_step['object_visible'] = np.array([object_visible])
-                
-                # Store new composite observations
                 current_step['aruco_ee_in_world'] = obs['aruco_ee_in_world']
                 current_step['aruco_object_in_world'] = obs['aruco_object_in_world']
                 current_step['aruco_ee_in_object'] = obs['aruco_ee_in_object']
                 current_step['aruco_object_in_ee'] = obs['aruco_object_in_ee']
                 current_step['aruco_visibility'] = obs['aruco_visibility']
-
-                # Convert angular velocity [wx, wy, wz] to per-step axis-angle 3-vector.
+                
                 angular_vel = angular_velocity_world
                 if dt > 0.0:
                     axis_angle_vec = angular_vel * dt
                 else:
                     axis_angle_vec = np.zeros(3)
-
-                # Augmented actions: original action + axis-angle 3-vector
+                
                 augmented_actions = np.concatenate([
-                    velocity_world,          # [vx, vy, vz]
-                    angular_velocity_world,  # [wx, wy, wz] (original angular velocity)
-                    axis_angle_vec,          # 3D axis-angle vector
-                    [gripper_target]         # gripper
+                    velocity_world,
+                    angular_velocity_world,
+                    axis_angle_vec,
+                    [gripper_target]
                 ])
                 current_step['augmented_actions'] = augmented_actions
-
+        
+        # Record control loop iteration timing
+        iteration_time = time.perf_counter() - iteration_start
+        self.profiler.record_control_loop_iteration(iteration_time)
+    
     def shutdown(self):
-        """Cleanup camera and windows."""
+        """Cleanup camera and print final statistics."""
+        super().shutdown()
         if self.camera:
             self.camera.release()
         cv2.destroyAllWindows()
         
-        # Print encoder read statistics from robot driver
+        # Print encoder read statistics
         if self.robot_driver:
             encoder_stats = self.robot_driver.get_encoder_read_stats()
             if encoder_stats['total_reads'] > 0:
@@ -438,61 +635,90 @@ class TeleopCameraControlEncoders(TeleopControl):
                 print(f"  Total reads: {encoder_stats['total_reads']}")
                 print(f"  Successful: {encoder_stats['successful_reads']} ({encoder_stats.get('success_rate', 0):.1f}%)")
                 print(f"  Failed: {encoder_stats['failed_reads']} ({encoder_stats.get('failure_rate', 0):.1f}%)")
-                print(f"  Partial reads: {encoder_stats['partial_reads']} (some motors succeeded)")
-                print(f"  Timeouts: {encoder_stats['timeout_reads']}")
-                if encoder_stats['failed_reads'] > 0:
-                    print(f"  Timeout rate (of failures): {encoder_stats.get('timeout_rate_of_failures', 0):.1f}%")
+                
+                if 'txrx_times_ms' in encoder_stats:
+                    txrx = encoder_stats['txrx_times_ms']
+                    print(f"\n  txRxPacket() Timing:")
+                    print(f"    avg={txrx['avg']:.2f}ms, min={txrx['min']:.2f}ms, max={txrx['max']:.2f}ms")
+                    print(f"    p95={txrx['p95']:.2f}ms, p99={txrx['p99']:.2f}ms")
+                    print(f"    Near timeout (18-22ms): {txrx.get('near_timeout_pct', 0):.1f}%")
+                
                 print(f"{'='*60}\n")
+        
+        # Print skipped reads count
+        if hasattr(self, '_skipped_reads_count') and self._skipped_reads_count > 0:
+            print(f"\n{'='*60}")
+            print(f"OPPORTUNISTIC READ STATISTICS")
+            print(f"{'='*60}")
+            print(f"  Skipped reads: {self._skipped_reads_count}")
+            skip_rate = (self._skipped_reads_count / (self._skipped_reads_count + self.encoder_poll_count)) * 100
+            print(f"  Skip rate: {skip_rate:.1f}%")
+            print(f"{'='*60}\n")
         
         # Print final encoder polling stats
         if self.encoder_poll_count > 0:
             avg_poll_time = np.mean(self.encoder_poll_times)
             max_poll_time = np.max(self.encoder_poll_times)
-            min_poll_time = np.min(self.encoder_poll_times)
             
             if len(self.encoder_poll_intervals) > 0:
                 avg_interval = np.mean(self.encoder_poll_intervals)
-                min_interval = np.min(self.encoder_poll_intervals)
-                max_interval = np.max(self.encoder_poll_intervals)
                 avg_freq = 1.0 / avg_interval if avg_interval > 0 else 0
-                min_freq = 1.0 / max_interval if max_interval > 0 else 0
-                max_freq = 1.0 / min_interval if min_interval > 0 else 0
+                efficiency = (avg_freq / robot_config.control_frequency) * 100 if robot_config.control_frequency > 0 else 0
             else:
-                avg_interval = 0.0
                 avg_freq = 0.0
-                min_freq = 0.0
-                max_freq = 0.0
-            
-            expected_freq = robot_config.control_frequency
+                efficiency = 0.0
             
             print(f"\n{'='*60}")
             print(f"ENCODER POLLING STATISTICS (Final)")
             print(f"{'='*60}")
             print(f"  Total polls: {self.encoder_poll_count}")
-            print(f"  Read time: avg={avg_poll_time*1000:.2f}ms, min={min_poll_time*1000:.2f}ms, max={max_poll_time*1000:.2f}ms")
+            print(f"  Read time: avg={avg_poll_time*1000:.2f}ms, max={max_poll_time*1000:.2f}ms")
             if len(self.encoder_poll_intervals) > 0:
-                print(f"  Poll interval: avg={avg_interval*1000:.2f}ms, min={min_interval*1000:.2f}ms, max={max_interval*1000:.2f}ms")
-                print(f"  Actual frequency: avg={avg_freq:.1f}Hz, min={min_freq:.1f}Hz, max={max_freq:.1f}Hz")
-            print(f"  Expected frequency: {expected_freq}Hz (control loop rate)")
-            if avg_freq > 0 and expected_freq > 0:
-                efficiency = (avg_freq / expected_freq) * 100
+                print(f"  Actual frequency: avg={avg_freq:.1f}Hz (target={robot_config.control_frequency:.1f}Hz)")
                 print(f"  Efficiency: {efficiency:.1f}% of expected")
+            print(f"{'='*60}\n")
+        
+        # Print final profiler stats (summary)
+        final_stats = self.profiler.get_final_stats()
+        if final_stats['total_iterations'] > 0:
+            print(f"\n{'='*60}")
+            print(f"CONTROL LOOP PERFORMANCE SUMMARY")
+            print(f"{'='*60}")
+            cl_stats = final_stats['control_loop']
+            if cl_stats:
+                print(f"  Total iterations: {final_stats['total_iterations']}")
+                print(f"  Missed deadlines: {final_stats['missed_deadlines']} ({cl_stats.get('missed_deadline_rate', 0):.1f}%)")
+                if cl_stats.get('actual_frequency', 0) > 0:
+                    print(f"  Frequency: {cl_stats['actual_frequency']:.2f}Hz (target: {cl_stats['target_frequency']:.2f}Hz)")
+                if final_stats['blocking_operations'] > 0:
+                    blocking_pct = (final_stats['blocking_operations'] / final_stats['total_iterations']) * 100
+                    print(f"  Blocking operations: {final_stats['blocking_operations']} ({blocking_pct:.1f}%)")
+            if final_stats['camera_read_count'] > 0:
+                failure_rate = (final_stats['camera_read_failures'] / final_stats['camera_read_count']) * 100
+                if failure_rate > 0:
+                    print(f"  Camera read failures: {final_stats['camera_read_failures']}/{final_stats['camera_read_count']} ({failure_rate:.1f}%)")
             print(f"{'='*60}\n")
         
         super().shutdown()
 
+
 def main():
     parser = argparse.ArgumentParser(description='WX200 Teleop with Camera and Encoder Polling')
-    parser.add_argument('--record', action='store_true', help='(Deprecated) Recording is controlled via GUI')
     parser.add_argument('--output', type=str, help='Output filename')
     parser.add_argument('--camera-id', type=int, default=None, help='Camera device ID (defaults to robot_config.camera_id)')
     parser.add_argument('--no-vis', action='store_true', help='Disable video window')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose profiling output (disables warning-only mode)')
     args = parser.parse_args()
+    
+    # Override warning-only mode if verbose requested
+    if args.verbose:
+        robot_config.warning_only_mode = False
+        robot_config.encoder_poll_stats_interval = 100
+        robot_config.control_perf_stats_interval = 500
     
     # Create and run
     controller = TeleopCameraControlEncoders(
-        # Always enable recording capability; GUI decides when to actually record.
-        enable_recording=True,
+        enable_recording=True,  # Always enable recording capability; GUI decides when to actually record
         output_path=args.output,
         camera_id=args.camera_id
     )
@@ -501,6 +727,7 @@ def main():
         controller.show_video = False
         
     controller.run()
+
 
 if __name__ == "__main__":
     main()

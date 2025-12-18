@@ -22,7 +22,7 @@ class RobotConfig:
     addr_present_current: int = 126  # 2 bytes, read-only
     
     # Serial communication
-    baudrate: int = 1000000
+    baudrate: int = 4000000  # 4 Mbps (Dynamixel X-series supports up to 4.5 Mbps)
     devicename: str = '/dev/ttyUSB0'
     protocol_version: float = 2.0
     
@@ -56,7 +56,38 @@ class RobotConfig:
     
     # Robot control parameters
     velocity_limit: int = 40  # Speed limit for movements (0=Max, 30=Slow/Safe)
-    control_frequency: float = 20.0  # Control loop frequency (Hz)
+    control_frequency: float = 10.0  # Outer loop frequency (Hz) - teleop/policy/observations
+    inner_control_frequency: float = 150.0  # Inner loop frequency (Hz) - IK solving and motor commands
+    inner_loop_skip_threshold: float = 0.002  # Minimum time remaining before outer loop deadline to execute inner loop (seconds)
+    use_threaded_control: bool = False  # If True, use separate threads for inner/outer loops (more responsive, but adds threading complexity)
+    
+    # Control loop timing and profiling parameters
+    deadline_threshold_factor: float = 0.8  # Time budget threshold as fraction of dt (80% = 80% of period)
+    blocking_outlier_threshold_control_step: float = 0.050  # Control steps exceeding this (seconds) are filtered as blocking ops
+    blocking_outlier_threshold_outer_loop: float = 0.100  # Outer loop iterations exceeding this (seconds) are filtered as blocking ops
+    blocking_interval_threshold: float = 0.200  # Intervals between iterations exceeding this (seconds) are filtered
+    recovery_gap_threshold: float = 0.100  # Gap between control steps exceeding this indicates recovery from blocking (seconds)
+    sleep_safety_margin: float = 0.003  # Safety margin for sleep timing to prevent deadline overshoot (seconds)
+    min_sleep_time: float = 0.001  # Minimum sleep time - don't sleep if less than this (seconds)
+    max_profiling_samples: int = 1000  # Maximum number of profiling samples to keep in memory
+    periodic_reporting_interval: int = 500  # Report performance stats every N control steps
+    periodic_reporting_sample_window: int = 500  # Number of recent samples to use for periodic reporting
+    safe_frequency_margin: float = 0.8  # Safety margin for estimated max frequency (80% of theoretical max)
+    lock_wait_threshold: float = 0.001  # Lock wait time threshold for contention tracking (seconds)
+    
+    # Camera profiling parameters
+    profiler_window_size: int = 200  # Sliding window size for camera profiler statistics
+    camera_assessment_threshold: float = 0.5  # Camera processing assessment threshold (50% of deadline)
+    missed_deadline_warning_threshold: float = 5.0  # Missed deadline percentage threshold for warning (%)
+    missed_deadline_error_threshold: float = 10.0  # Missed deadline percentage threshold for error (%)
+    frame_downscale_factor: int = 4  # Frame downscale factor for recording (1/4 resolution = 1/16 pixels)
+    default_profile_interval: int = 100  # Default interval for printing profiling stats (iterations)
+    
+    # Data collection verbosity settings
+    verbose_profiling: bool = False  # If True, print detailed periodic profiling stats
+    warning_only_mode: bool = True  # If True, only print warnings when thresholds exceeded
+    encoder_poll_stats_interval: int = 100  # Print encoder poll stats every N polls (0 = disable)
+    control_perf_stats_interval: int = 500  # Print control step stats every N steps (0 = disable)
     
     # Vision / camera configuration
     # Note: camera_id maps to /dev/video{camera_id}

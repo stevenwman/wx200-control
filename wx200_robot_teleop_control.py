@@ -221,19 +221,38 @@ class TeleopControl(RobotControlBase):
                 print("GUI COMMAND: 'h' - Moving to home position...", flush=True)
                 print("="*60, flush=True)
 
-                # Send home command (assumes gripper is already healthy/open or will be handled separately)
-                self.robot_driver.send_motor_positions(
-                    self.home_motor_positions, 
-                    velocity_limit=robot_config.velocity_limit
-                )
-                
-                # Wait for movement (commands will be checked in control loop)
+                # IMPORTANT: Pause inner loop to prevent it from overriding home command
+                # The inner loop sends position commands at 100Hz based on IK, which would override
+                # the home position command. Pausing it allows the home command to execute.
+                if hasattr(self, '_paused_for_command'):
+                    self._paused_for_command = True
+
+                # Send home command repeatedly during movement (inner loop is paused, so it won't interfere)
                 print("Moving to home...", flush=True)
                 start_time = time.perf_counter()
                 movement_duration = 3.0
-                check_interval = 0.1  # Check every 100ms
+                check_interval = 0.05  # Check every 50ms, resend command every 100ms
+                last_command_time = 0.0
+                command_interval = 0.1  # Resend position command every 100ms
                 
                 while time.perf_counter() - start_time < movement_duration:
+                    current_time = time.perf_counter() - start_time
+                    
+                    # Resend home position command periodically to ensure it's maintained
+                    if current_time - last_command_time >= command_interval:
+                        if hasattr(self, '_driver_lock'):
+                            with self._driver_lock:
+                                self.robot_driver.send_motor_positions(
+                                    self.home_motor_positions, 
+                                    velocity_limit=robot_config.velocity_limit
+                                )
+                        else:
+                            self.robot_driver.send_motor_positions(
+                                self.home_motor_positions, 
+                                velocity_limit=robot_config.velocity_limit
+                            )
+                        last_command_time = current_time
+                    
                     # Check for new commands during movement
                     new_cmd = self.control_gui.get_command() if self.control_gui else None
                     if new_cmd in ['h', 'g', 'r', 's']:
@@ -241,11 +260,21 @@ class TeleopControl(RobotControlBase):
                             self.control_gui.command_queue.insert(0, new_cmd)
                         print("(Movement interrupted by new command)", flush=True)
                         break
+                    
                     time.sleep(check_interval)
+                
+                # Resume inner loop after movement
+                if hasattr(self, '_paused_for_command'):
+                    self._paused_for_command = False
                 
                 # Sync MuJoCo to actual robot position after moving
                 time.sleep(0.1)
-                robot_encoders = self.robot_driver.read_all_encoders(max_retries=5, retry_delay=0.2)
+                # Acquire driver lock to prevent race condition with inner control loop
+                if hasattr(self, '_driver_lock'):
+                    with self._driver_lock:
+                        robot_encoders = self.robot_driver.read_all_encoders(max_retries=5, retry_delay=0.2)
+                else:
+                    robot_encoders = self.robot_driver.read_all_encoders(max_retries=5, retry_delay=0.2)
                 robot_joint_angles, actual_position, actual_orientation_quat_wxyz = sync_robot_to_mujoco(
                     robot_encoders, self.translator, self.model, self.data, self.configuration
                 )
@@ -258,6 +287,11 @@ class TeleopControl(RobotControlBase):
                 # Keep gripper command state in sync with physical gripper after homing
                 if len(robot_joint_angles) > 5:
                     self.gripper_current_position = robot_joint_angles[5]
+                    # Update shared gripper command so inner loop knows the new position
+                    if hasattr(self, '_command_lock'):
+                        with self._command_lock:
+                            self._latest_gripper_command = self.gripper_current_position
+                            self.gripper_current_position = robot_joint_angles[5]
                 
                 print(f"✓ Robot moved to home position: {actual_position}", flush=True)
                 print("="*60 + "\n", flush=True)
@@ -270,31 +304,115 @@ class TeleopControl(RobotControlBase):
 
                 gripper_motor_id = robot_config.motor_ids[-1]
 
+                # IMPORTANT: Pause inner loop to prevent it from interfering with gripper reset
+                # The inner loop sends position commands at 100Hz, which would override gripper commands.
+                if hasattr(self, '_paused_for_command'):
+                    self._paused_for_command = True
+
                 # 1) Reboot gripper motor to clear over-torque / error states
+                # Acquire driver lock to prevent race condition with inner control loop
                 try:
-                    self.robot_driver.reboot_motor(gripper_motor_id)
+                    if hasattr(self, '_driver_lock'):
+                        with self._driver_lock:
+                            self.robot_driver.reboot_motor(gripper_motor_id)
+                    else:
+                        self.robot_driver.reboot_motor(gripper_motor_id)
+                    
+                    # After reboot, motor needs time to fully initialize before accepting commands
+                    # Wait a bit longer to ensure motor is ready for torque re-enable
+                    time.sleep(0.2)  # Increased from 0.1 to 0.2 for more reliable initialization
                 except Exception as e:
                     print(f"⚠️  Warning: Failed to reboot gripper motor: {e}", flush=True)
 
-                # 2) Command gripper to open
+                # 2) Re-enable torque (with retry if needed)
+                # Motor may not respond immediately after reboot, so retry a few times
+                from dynamixel_sdk import COMM_SUCCESS
+                torque_enabled = False
+                max_torque_retries = 3
+                dxl_comm_result = None
+                for retry in range(max_torque_retries):
+                    try:
+                        if hasattr(self, '_driver_lock'):
+                            with self._driver_lock:
+                                dxl_comm_result, dxl_error = self.robot_driver.packetHandler.write1ByteTxRx(
+                                    self.robot_driver.portHandler,
+                                    gripper_motor_id,
+                                    robot_config.addr_torque_enable,
+                                    1
+                                )
+                        else:
+                            dxl_comm_result, dxl_error = self.robot_driver.packetHandler.write1ByteTxRx(
+                                self.robot_driver.portHandler,
+                                gripper_motor_id,
+                                robot_config.addr_torque_enable,
+                                1
+                            )
+                        
+                        if dxl_comm_result == COMM_SUCCESS and dxl_error == 0:
+                            torque_enabled = True
+                            break
+                        else:
+                            if retry < max_torque_retries - 1:
+                                time.sleep(0.1)  # Wait before retry
+                    except Exception as e:
+                        if retry < max_torque_retries - 1:
+                            time.sleep(0.1)
+                        else:
+                            print(f"⚠️  Warning: Failed to re-enable torque on motor {gripper_motor_id} after {max_torque_retries} attempts: {e}", flush=True)
+                
+                if not torque_enabled:
+                    # Don't treat this as fatal - motor may auto-enable or next command will work
+                    error_msg = "No status packet received"
+                    if dxl_comm_result is not None and hasattr(self.robot_driver, 'packetHandler'):
+                        error_msg = self.robot_driver.packetHandler.getTxRxResult(dxl_comm_result)
+                    print(f"⚠️  Warning: Failed to re-enable torque on motor {gripper_motor_id}: [{error_msg}]", flush=True)
+                    print(f"   Note: Motor should auto-enable or respond on next command. If gripper is unresponsive, try reset again.", flush=True)
+                
+                # 3) Command gripper to open (send repeatedly to ensure it sticks)
                 try:
                     gripper_open_encoder = robot_config.gripper_encoder_max
-                    self.robot_driver.send_motor_positions(
-                        {gripper_motor_id: gripper_open_encoder},
-                        velocity_limit=robot_config.velocity_limit
-                    )
-                    time.sleep(0.3)
+                    # Send gripper open command multiple times to ensure it's maintained
+                    for _ in range(3):
+                        # Acquire driver lock to prevent race condition with inner control loop
+                        if hasattr(self, '_driver_lock'):
+                            with self._driver_lock:
+                                self.robot_driver.send_motor_positions(
+                                    {gripper_motor_id: gripper_open_encoder},
+                                    velocity_limit=robot_config.velocity_limit
+                                )
+                        else:
+                            self.robot_driver.send_motor_positions(
+                                {gripper_motor_id: gripper_open_encoder},
+                                velocity_limit=robot_config.velocity_limit
+                            )
+                        time.sleep(0.1)
+                    
                     print("✓ Gripper reset: motor rebooted and opened.", flush=True)
                 except Exception as e:
                     print(f"⚠️  Warning: Failed to send gripper-open command: {e}", flush=True)
+                
+                # Resume inner loop after reset
+                if hasattr(self, '_paused_for_command'):
+                    self._paused_for_command = False
 
                 # 3) Update internal gripper state to match open position
                 try:
-                    robot_encoders = self.robot_driver.read_all_encoders(max_retries=3, retry_delay=0.1)
+                    # Acquire driver lock to prevent race condition with inner control loop
+                    if hasattr(self, '_driver_lock'):
+                        with self._driver_lock:
+                            robot_encoders = self.robot_driver.read_all_encoders(max_retries=3, retry_delay=0.1)
+                    else:
+                        robot_encoders = self.robot_driver.read_all_encoders(max_retries=3, retry_delay=0.1)
                     if 7 in robot_encoders and robot_encoders[7] is not None:
                         # Use encoder mapping to update current gripper position in sim units
                         from robot_control.robot_joint_to_motor import encoder_to_gripper_position
-                        self.gripper_current_position = encoder_to_gripper_position(robot_encoders[7])
+                        new_gripper_pos = encoder_to_gripper_position(robot_encoders[7])
+                        self.gripper_current_position = new_gripper_pos
+                        # Update shared gripper command so inner loop knows the new position
+                        if hasattr(self, '_command_lock'):
+                            with self._command_lock:
+                                self._latest_gripper_command = new_gripper_pos
+                                self.gripper_current_position = new_gripper_pos
                 except Exception:
                     # Non-fatal if we fail to read; next loop will converge from IK
                     pass

@@ -126,9 +126,11 @@ class RobotDriver:
         if not self.portHandler.setBaudRate(self.baudrate):
             raise RuntimeError(f"Failed to set baudrate {self.baudrate}")
         
-        # Set shorter packet timeout for faster reads (default is often 100ms, we use 20ms)
-        # This speeds up GroupSyncRead when motors respond quickly
-        self.portHandler.setPacketTimeout(20)  # milliseconds
+        # Set packet timeout for reads
+        # Note: Based on profiling, motors typically respond in 9-25ms (avg ~18ms, p95 ~25ms)
+        # Setting timeout to 30ms to accommodate p95 while avoiding unnecessary waits
+        # If you see many timeouts, consider checking USB latency timer (should be 1ms, not default 16ms)
+        self.portHandler.setPacketTimeout(30)  # milliseconds (was 20ms, increased based on profiling)
         
         # Reboot motors to clear error states
         self.reboot_all_motors()
@@ -314,7 +316,19 @@ class RobotDriver:
                 # Note: We keep the default timeout (20ms set in connect()) as 15ms was too aggressive
                 # and caused timeouts leading to fallback to slower individual reads
                 self.encoder_read_stats['total_reads'] += 1
+                
+                # Time the actual txRxPacket call to see if we're waiting for timeout
+                import time
+                txrx_start = time.perf_counter()
                 dxl_comm_result = self.groupSyncRead.txRxPacket()
+                txrx_duration = (time.perf_counter() - txrx_start) * 1000  # Convert to ms
+                
+                # Track txRxPacket timing for analysis
+                if not hasattr(self, '_txrx_times'):
+                    self._txrx_times = []
+                self._txrx_times.append(txrx_duration)
+                if len(self._txrx_times) > 1000:
+                    self._txrx_times.pop(0)
                 
                 if dxl_comm_result != COMM_SUCCESS:
                     # If sync read fails, fall back to individual reads
@@ -439,7 +453,24 @@ class RobotDriver:
                 stats['timeout_rate_of_failures'] = (stats['timeout_reads'] / stats['failed_reads']) * 100
             else:
                 stats['timeout_rate_of_failures'] = 0.0
-        else:
+        
+        # Add txRxPacket timing stats if available
+        if hasattr(self, '_txrx_times') and len(self._txrx_times) > 0:
+            import numpy as np
+            txrx_array = np.array(self._txrx_times)
+            stats['txrx_times_ms'] = {
+                'avg': float(np.mean(txrx_array)),
+                'min': float(np.min(txrx_array)),
+                'max': float(np.max(txrx_array)),
+                'p95': float(np.percentile(txrx_array, 95)),
+                'p99': float(np.percentile(txrx_array, 99)),
+                'count': len(txrx_array)
+            }
+            # Check if we're hitting the timeout (20ms) - if most reads are near 20ms, we're timeout-bound
+            near_timeout = np.sum((txrx_array > 18.0) & (txrx_array < 22.0))
+            stats['txrx_times_ms']['near_timeout_pct'] = (near_timeout / len(txrx_array)) * 100
+        
+        if stats['total_reads'] == 0:
             stats['success_rate'] = 0.0
             stats['failure_rate'] = 0.0
             stats['timeout_rate_of_failures'] = 0.0
