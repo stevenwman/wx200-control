@@ -7,6 +7,9 @@ This ensures we're recording the true robot state rather than relying on MuJoCo 
 
 Updated with selective profiling - tracks performance but only prints warnings when issues detected.
 Based on wx200_robot_profile_camera.py but optimized for data collection with minimal verbosity.
+
+ArUco polling runs at camera FPS (30 Hz) for maximum update rate, while logging/storage
+happens at control frequency (10 Hz).
 """
 import cv2
 import numpy as np
@@ -22,9 +25,164 @@ from robot_control.robot_config import robot_config
 from wx200_robot_teleop_control import TeleopControl, save_trajectory
 from camera import Camera, is_gstreamer_available, ArUcoPoseEstimator, MARKER_SIZE, get_approx_camera_matrix
 from robot_control.robot_joint_to_motor import JointToMotorTranslator, encoders_to_joint_angles
+from loop_rate_limiters import RateLimiter
 
 # Shorter axes for visualization to reduce chance of going off-frame (and warnings)
 AXIS_LENGTH = MARKER_SIZE * robot_config.aruco_axis_length_scale
+
+
+class ArUcoProfiler:
+    """
+    Profiler for ArUco polling thread that runs at camera FPS.
+    
+    Tracks ArUco detection performance separately from control loop profiling.
+    """
+    
+    def __init__(self):
+        """Initialize ArUco profiler."""
+        self.window_size = robot_config.profiler_window_size
+        
+        # Track ArUco polling timing
+        self.poll_times = deque(maxlen=self.window_size)
+        self.poll_intervals = deque(maxlen=self.window_size)
+        self.poll_count = 0
+        self.last_poll_timestamp = None
+        
+        # Track component timings
+        self.detect_times = deque(maxlen=self.window_size)  # ArUco detection time
+        self.pose_compute_times = deque(maxlen=self.window_size)  # Pose computation time
+    
+    def record_poll_iteration(self, total_time, detect_time, pose_time, interval=None):
+        """Record a single ArUco poll iteration."""
+        self.poll_times.append(total_time)
+        if detect_time is not None:
+            self.detect_times.append(detect_time)
+        if pose_time is not None:
+            self.pose_compute_times.append(pose_time)
+        if interval is not None:
+            self.poll_intervals.append(interval)
+        self.poll_count += 1
+    
+    def get_statistics(self):
+        """Get current statistics."""
+        stats = {
+            'poll_count': self.poll_count,
+        }
+        
+        if self.poll_times:
+            times_ms = [t * 1000 for t in self.poll_times]
+            stats['poll_time'] = {
+                'avg': np.mean(times_ms),
+                'min': np.min(times_ms),
+                'max': np.max(times_ms),
+                'p95': np.percentile(times_ms, 95) if len(times_ms) > 1 else times_ms[0],
+                'count': len(times_ms)
+            }
+        else:
+            stats['poll_time'] = None
+        
+        if self.detect_times:
+            times_ms = [t * 1000 for t in self.detect_times]
+            stats['detect_time'] = {
+                'avg': np.mean(times_ms),
+                'max': np.max(times_ms),
+                'count': len(times_ms)
+            }
+        else:
+            stats['detect_time'] = None
+        
+        if self.pose_compute_times:
+            times_ms = [t * 1000 for t in self.pose_compute_times]
+            stats['pose_time'] = {
+                'avg': np.mean(times_ms),
+                'max': np.max(times_ms),
+                'count': len(times_ms)
+            }
+        else:
+            stats['pose_time'] = None
+        
+        if self.poll_intervals:
+            intervals_ms = [t * 1000 for t in self.poll_intervals]
+            avg_interval = np.mean(intervals_ms) / 1000.0
+            stats['frequency'] = {
+                'actual': 1.0 / avg_interval if avg_interval > 0 else 0,
+                'target': robot_config.camera_fps,
+                'avg_interval_ms': np.mean(intervals_ms),
+                'min_interval_ms': np.min(intervals_ms),
+                'max_interval_ms': np.max(intervals_ms),
+            }
+        else:
+            stats['frequency'] = None
+        
+        return stats
+    
+    def print_periodic_stats(self):
+        """Print periodic statistics (called during polling)."""
+        if len(self.poll_times) < 50:
+            return
+        
+        avg_poll_time = np.mean(list(self.poll_times)[-100:])
+        max_poll_time = np.max(list(self.poll_times)[-100:])
+        
+        avg_detect_time = np.mean(list(self.detect_times)[-100:]) if self.detect_times else 0
+        avg_pose_time = np.mean(list(self.pose_compute_times)[-100:]) if self.pose_compute_times else 0
+        
+        if len(self.poll_intervals) >= 50:
+            avg_interval = np.mean(list(self.poll_intervals)[-100:])
+            actual_freq = 1.0 / avg_interval if avg_interval > 0 else 0
+        else:
+            actual_freq = 0
+        
+        print(f"[ARUCO POLL #{self.poll_count}] "
+              f"freq={actual_freq:.1f}Hz (target={robot_config.camera_fps:.1f}Hz), "
+              f"total={avg_poll_time*1000:.1f}ms (detect={avg_detect_time*1000:.1f}ms, "
+              f"pose={avg_pose_time*1000:.1f}ms, max={max_poll_time*1000:.1f}ms)")
+    
+    def print_final_stats(self):
+        """Print final statistics."""
+        stats = self.get_statistics()
+        
+        if stats['poll_count'] == 0:
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"ARUCO POLLING THREAD STATISTICS")
+        print(f"{'='*60}")
+        print(f"  Total polls: {stats['poll_count']}")
+        
+        if stats['poll_time']:
+            pt = stats['poll_time']
+            print(f"  Total poll time: avg={pt['avg']:.2f}ms, min={pt['min']:.2f}ms, "
+                  f"max={pt['max']:.2f}ms, p95={pt['p95']:.2f}ms")
+            
+            if stats['detect_time']:
+                dt = stats['detect_time']
+                print(f"    - Detection: avg={dt['avg']:.2f}ms, max={dt['max']:.2f}ms")
+            
+            if stats['pose_time']:
+                pt = stats['pose_time']
+                print(f"    - Pose computation: avg={pt['avg']:.2f}ms, max={pt['max']:.2f}ms")
+        
+        if stats['frequency']:
+            freq = stats['frequency']
+            efficiency = (freq['actual'] / freq['target']) * 100 if freq['target'] > 0 else 0
+            print(f"  Poll interval: avg={freq['avg_interval_ms']:.2f}ms, "
+                  f"min={freq['min_interval_ms']:.2f}ms, max={freq['max_interval_ms']:.2f}ms")
+            print(f"  Actual frequency: avg={freq['actual']:.2f}Hz, min={1.0/(freq['max_interval_ms']/1000.0):.2f}Hz, "
+                  f"max={1.0/(freq['min_interval_ms']/1000.0):.2f}Hz")
+            print(f"  Target frequency: {freq['target']:.1f}Hz")
+            print(f"  Efficiency: {efficiency:.1f}% of target")
+            
+            # Check if keeping up with target
+            target_dt = 1.0 / freq['target']
+            if stats['poll_time'] and stats['poll_time']['avg'] > target_dt * 800:  # 80% of budget
+                print(f"  ⚠️  WARNING: Poll time ({stats['poll_time']['avg']:.1f}ms) close to budget ({target_dt*1000:.1f}ms)")
+                print(f"     Consider reducing camera_fps or optimizing detection")
+            elif stats['poll_time']:
+                budget_pct = (stats['poll_time']['avg'] / (target_dt * 1000)) * 100
+                print(f"  ✓ Poll time well within budget (using {budget_pct:.1f}% of period)")
+        
+        print(f"{'='*60}\n")
 
 
 class LightweightProfiler:
@@ -53,6 +211,11 @@ class LightweightProfiler:
         self.total_camera_time = deque(maxlen=self.window_size)
         self.camera_read_fail_count = 0
         self.camera_read_count = 0
+        
+        # Track frame storage/polling operations (for performance analysis)
+        self.frame_storage_times = deque(maxlen=self.window_size)
+        self.frame_poll_times = deque(maxlen=self.window_size)  # Time to read frame from camera
+        self.total_frame_ops_time = deque(maxlen=self.window_size)  # Frame poll + storage combined
         
         # Warning tracking (prevent spam)
         self._last_warning_time = {}
@@ -89,6 +252,18 @@ class LightweightProfiler:
         if not read_success:
             self.camera_read_fail_count += 1
             self._check_and_warn_camera()
+    
+    def record_frame_poll_time(self, elapsed_time):
+        """Record camera frame read/poll time."""
+        self.frame_poll_times.append(elapsed_time)
+    
+    def record_frame_storage_time(self, elapsed_time):
+        """Record frame storage/downscaling time."""
+        self.frame_storage_times.append(elapsed_time)
+    
+    def record_total_frame_ops_time(self, elapsed_time):
+        """Record total frame operations time (poll + storage)."""
+        self.total_frame_ops_time.append(elapsed_time)
     
     def _check_and_warn_control_loop(self):
         """Check control loop performance and warn if issues detected."""
@@ -178,7 +353,7 @@ class LightweightProfiler:
     
     def get_final_stats(self):
         """Get final statistics for shutdown reporting."""
-        return {
+        stats = {
             'control_loop': self._get_control_loop_stats(),
             'total_iterations': self.total_iterations,
             'missed_deadlines': self.missed_deadlines,
@@ -186,6 +361,48 @@ class LightweightProfiler:
             'camera_read_failures': self.camera_read_fail_count,
             'camera_read_count': self.camera_read_count,
         }
+        
+        # Frame operation statistics
+        if self.frame_poll_times:
+            times_ms = [t * 1000 for t in list(self.frame_poll_times)]
+            stats['frame_poll'] = {
+                'avg': np.mean(times_ms),
+                'min': np.min(times_ms),
+                'max': np.max(times_ms),
+                'p95': np.percentile(times_ms, 95) if len(times_ms) > 1 else times_ms[0],
+                'p99': np.percentile(times_ms, 99) if len(times_ms) > 1 else times_ms[0],
+                'count': len(times_ms)
+            }
+        else:
+            stats['frame_poll'] = None
+        
+        if self.frame_storage_times:
+            times_ms = [t * 1000 for t in list(self.frame_storage_times)]
+            stats['frame_storage'] = {
+                'avg': np.mean(times_ms),
+                'min': np.min(times_ms),
+                'max': np.max(times_ms),
+                'p95': np.percentile(times_ms, 95) if len(times_ms) > 1 else times_ms[0],
+                'p99': np.percentile(times_ms, 99) if len(times_ms) > 1 else times_ms[0],
+                'count': len(times_ms)
+            }
+        else:
+            stats['frame_storage'] = None
+        
+        if self.total_frame_ops_time:
+            times_ms = [t * 1000 for t in list(self.total_frame_ops_time)]
+            stats['total_frame_ops'] = {
+                'avg': np.mean(times_ms),
+                'min': np.min(times_ms),
+                'max': np.max(times_ms),
+                'p95': np.percentile(times_ms, 95) if len(times_ms) > 1 else times_ms[0],
+                'p99': np.percentile(times_ms, 99) if len(times_ms) > 1 else times_ms[0],
+                'count': len(times_ms)
+            }
+        else:
+            stats['total_frame_ops'] = None
+        
+        return stats
 
 
 class TeleopCameraControlEncoders(TeleopControl):
@@ -198,6 +415,7 @@ class TeleopCameraControlEncoders(TeleopControl):
     - Records encoder values in trajectory
     - Records joint angles derived from encoders (not MuJoCo estimates)
     - Lightweight profiling with warning-only output mode
+    - High-frequency ArUco polling (camera FPS) with low-frequency logging (control frequency)
     
     Tracks:
     - ID 0: World/Base Frame
@@ -232,6 +450,7 @@ class TeleopCameraControlEncoders(TeleopControl):
         self.latest_ee_pose_from_encoders = None
         
         # Latest ArUco observations (updated every outer loop iteration, for gym env get_obs)
+        # Updated at camera FPS (30 Hz) by background thread, read at control frequency (10 Hz) for logging
         self.latest_aruco_obs = {
             'aruco_ee_in_world': np.zeros(7),
             'aruco_object_in_world': np.zeros(7),
@@ -254,12 +473,165 @@ class TeleopCameraControlEncoders(TeleopControl):
         self.encoder_lock_wait_times = []
         self.encoder_lock_contention_count = 0
         
-        # Lightweight profiler (warning-only mode)
+        # Lightweight profiler (warning-only mode) - for control loop
         self.profiler = LightweightProfiler()
+        
+        # ArUco profiler - separate from control loop profiling
+        self.aruco_profiler = ArUcoProfiler()
+        
+        # Frame recording (always enabled when recording)
+        self.record_frames = False  # Enabled when actually recording
+        
+        # High-frequency ArUco polling (runs at camera FPS, separate from control loop)
+        self._aruco_polling_active = False
+        self._aruco_poll_thread = None
+        self._aruco_lock = threading.Lock()  # Protects latest_aruco_obs updates
+        self._latest_frame_for_recording = None  # Latest frame for recording (thread-safe)
         
         # Visualization
         self.show_video = True
         self.show_axes = True
+        
+    def _start_aruco_polling(self):
+        """Start background thread for high-frequency ArUco polling at camera FPS."""
+        if self.camera is None:
+            return
+        
+        self._aruco_polling_active = True
+        self._aruco_poll_thread = threading.Thread(target=self._aruco_poll_loop, daemon=True)
+        self._aruco_poll_thread.start()
+        print(f"✓ Started ArUco polling thread at {robot_config.camera_fps} Hz")
+    
+    def _aruco_poll_loop(self):
+        """Background thread that polls camera and detects ArUco markers at camera FPS."""
+        rate_limiter = RateLimiter(frequency=robot_config.camera_fps, warn=False)
+        
+        while self._aruco_polling_active and self.camera:
+            loop_start = time.perf_counter()
+            
+            # Track interval since last poll
+            interval = None
+            if self.aruco_profiler.last_poll_timestamp is not None:
+                interval = loop_start - self.aruco_profiler.last_poll_timestamp
+                if interval >= 1.0:  # Skip large intervals (gaps)
+                    interval = None
+            self.aruco_profiler.last_poll_timestamp = loop_start
+            
+            # Read camera frame
+            ret, frame = self.camera.read()
+            if not ret:
+                rate_limiter.sleep()
+                continue
+            
+            # Convert to grayscale and detect markers
+            detect_start = time.perf_counter()
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = self.detector.detectMarkers(gray)
+            detect_time = time.perf_counter() - detect_start
+            
+            # Process tags
+            pose_start = time.perf_counter()
+            r_world, t_world = self.estimator.process_tag(
+                corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_world_id
+            )
+            r_obj, t_obj = self.estimator.process_tag(
+                corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_object_id
+            )
+            r_ee, t_ee = self.estimator.process_tag(
+                corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_ee_id
+            )
+            
+            # Update visibility flags
+            world_visible = False
+            object_visible = False
+            ee_visible = False
+            if ids is not None:
+                ids_arr = np.atleast_1d(ids).ravel()
+                world_visible = np.any(ids_arr == robot_config.aruco_world_id)
+                object_visible = np.any(ids_arr == robot_config.aruco_object_id)
+                ee_visible = np.any(ids_arr == robot_config.aruco_ee_id)
+            
+            # Compute relative poses
+            obs = {
+                'aruco_ee_in_world': np.zeros(7),
+                'aruco_object_in_world': np.zeros(7),
+                'aruco_ee_in_object': np.zeros(7),
+                'aruco_object_in_ee': np.zeros(7),
+                'aruco_visibility': np.zeros(3)
+            }
+            
+            obs['aruco_visibility'][0] = 1.0 if world_visible else 0.0
+            obs['aruco_visibility'][1] = 1.0 if object_visible else 0.0
+            obs['aruco_visibility'][2] = 1.0 if ee_visible else 0.0
+            
+            # Compute relative poses
+            pos, quat = self._compute_relative_pose(r_world, t_world, r_ee, t_ee)
+            obs['aruco_ee_in_world'] = np.concatenate([pos, quat])
+            
+            pos, quat = self._compute_relative_pose(r_world, t_world, r_obj, t_obj)
+            obs['aruco_object_in_world'] = np.concatenate([pos, quat])
+            
+            pos, quat = self._compute_relative_pose(r_obj, t_obj, r_ee, t_ee)
+            obs['aruco_ee_in_object'] = np.concatenate([pos, quat])
+            
+            pos, quat = self._compute_relative_pose(r_ee, t_ee, r_obj, t_obj)
+            obs['aruco_object_in_ee'] = np.concatenate([pos, quat])
+            pose_time = time.perf_counter() - pose_start
+            
+            # Update latest observations and frame (thread-safe)
+            with self._aruco_lock:
+                self.latest_aruco_obs = {k: v.copy() for k, v in obs.items()}
+                # Store latest frame for recording (downscaled)
+                if self.is_recording:
+                    downscaled_width = robot_config.camera_width // robot_config.frame_downscale_factor
+                    downscaled_height = robot_config.camera_height // robot_config.frame_downscale_factor
+                    self._latest_frame_for_recording = cv2.resize(
+                        frame, (downscaled_width, downscaled_height), interpolation=cv2.INTER_AREA
+                    )
+            
+            # Visualization (only in polling thread to avoid conflicts)
+            if self.show_video:
+                vis_frame = frame.copy()
+                if ids is not None:
+                    cv2.aruco.drawDetectedMarkers(vis_frame, corners, ids)
+                if self.show_axes:
+                    if r_world is not None:
+                        cv2.drawFrameAxes(vis_frame, self.cam_matrix, self.dist_coeffs, r_world, t_world, AXIS_LENGTH)
+                    if r_obj is not None:
+                        cv2.drawFrameAxes(vis_frame, self.cam_matrix, self.dist_coeffs, r_obj, t_obj, AXIS_LENGTH)
+                    if r_ee is not None:
+                        cv2.drawFrameAxes(vis_frame, self.cam_matrix, self.dist_coeffs, r_ee, t_ee, AXIS_LENGTH)
+                
+                disp = cv2.resize(
+                    vis_frame,
+                    (robot_config.camera_width // 2, robot_config.camera_height // 2)
+                )
+                cv2.imshow('Robot Camera View', disp)
+                cv2.waitKey(1)
+            
+            # Track total poll time and record in profiler
+            total_poll_time = time.perf_counter() - loop_start
+            self.aruco_profiler.record_poll_iteration(
+                total_poll_time, detect_time, pose_time, interval
+            )
+            
+            # Print periodic stats (every 300 polls = ~10 seconds at 30 Hz)
+            if self.aruco_profiler.poll_count % 300 == 0:
+                self.aruco_profiler.print_periodic_stats()
+            
+            rate_limiter.sleep()
+    
+    def _compute_relative_pose(self, r_ref, t_ref, r_tgt, t_tgt):
+        """Compute target pose relative to reference frame. Returns (pos, quat_wxyz) or (zeros, zeros)."""
+        if r_ref is None or t_ref is None or r_tgt is None or t_tgt is None:
+            return np.zeros(3), np.array([1., 0., 0., 0.])
+            
+        r_rel, t_rel = self.estimator.get_relative_pose(r_ref, t_ref, r_tgt, t_tgt)
+        R_rel, _ = cv2.Rodrigues(r_rel)
+        quat_xyzw = R.from_matrix(R_rel).as_quat()
+        quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+        
+        return t_rel.flatten(), quat_wxyz
         
     def on_ready(self):
         """Initialize camera and estimator."""
@@ -268,6 +640,8 @@ class TeleopCameraControlEncoders(TeleopControl):
         print("\n" + "="*60)
         print("Initializing Camera & ArUco Estimator...")
         print(f"Encoder polling: At recording rate ({robot_config.control_frequency} Hz)")
+        print(f"ArUco polling: At camera FPS ({robot_config.camera_fps} Hz) in background thread")
+        print(f"Trajectory logging: At control frequency ({robot_config.control_frequency} Hz)")
         
         # Initialize separate MuJoCo instance for encoder-based forward kinematics
         from pathlib import Path
@@ -294,6 +668,9 @@ class TeleopCameraControlEncoders(TeleopControl):
             
             print(f"✓ Camera started: Device {self.camera_id} @ {self.width}x{self.height}")
             print("✓ ArUco Estimator ready (IDs: 0=World, 2=Object)")
+            
+            # Start high-frequency ArUco polling thread (at camera FPS)
+            self._start_aruco_polling()
         except Exception as e:
             print(f"❌ Error starting camera: {e}")
             self.camera = None
@@ -443,22 +820,14 @@ class TeleopCameraControlEncoders(TeleopControl):
                     print(f"⚠️  ENCODER WARNING: Slow reads detected (avg={avg_time*1000:.1f}ms, max={max_time*1000:.1f}ms)")
                     self._last_encoder_warning_time = now
     
-    def _compute_relative_pose(self, r_ref, t_ref, r_tgt, t_tgt):
-        """Compute target pose relative to reference frame. Returns (pos, quat_wxyz) or (zeros, zeros)."""
-        if r_ref is None or t_ref is None or r_tgt is None or t_tgt is None:
-            return np.zeros(3), np.array([1., 0., 0., 0.])
-            
-        r_rel, t_rel = self.estimator.get_relative_pose(r_ref, t_ref, r_tgt, t_tgt)
-        R_rel, _ = cv2.Rodrigues(r_rel)
-        quat_xyzw = R.from_matrix(R_rel).as_quat()
-        quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
-        
-        return t_rel.flatten(), quat_wxyz
-    
     def on_control_loop_iteration(self, velocity_world, angular_velocity_world, gripper_target, dt, outer_loop_start_time=None):
-        """Read camera, detect markers, poll encoders (always), and update trajectory if recording."""
+        """
+        Poll encoders and update trajectory if recording.
+        
+        ArUco detection now runs in background thread at camera FPS (30 Hz).
+        This method only reads the latest ArUco observations (thread-safe) and stores them at control frequency (10 Hz).
+        """
         iteration_start = time.perf_counter()
-        camera_start = time.perf_counter()
         
         # Handle GUI commands
         self._handle_control_input()
@@ -466,98 +835,30 @@ class TeleopCameraControlEncoders(TeleopControl):
         # Poll encoders
         self._poll_encoders(outer_loop_start_time=outer_loop_start_time)
         
-        # Initialize storage for observations
-        obs = {
-            'aruco_ee_in_world': np.zeros(7),
-            'aruco_object_in_world': np.zeros(7),
-            'aruco_ee_in_object': np.zeros(7),
-            'aruco_object_in_ee': np.zeros(7),
-            'aruco_visibility': np.zeros(3)
-        }
+        # Read latest ArUco observations (thread-safe, updated at camera FPS by background thread)
+        with self._aruco_lock:
+            obs = {k: v.copy() for k, v in self.latest_aruco_obs.items()}
+        
+        # Compute object_pose_data for backward compatibility
         object_pose_data = np.zeros(7)
         object_visible = 0.0
+        if obs['aruco_visibility'][0] and obs['aruco_visibility'][1]:
+            object_pose_data = obs['aruco_object_in_world']
+            object_visible = 1.0
         
-        # Camera processing
-        if self.camera:
-            ret, frame = self.camera.read()
-            camera_read_time = time.perf_counter() - camera_start
-            
-            if ret:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                corners, ids, _ = self.detector.detectMarkers(gray)
-                
-                # Process tags
-                r_world, t_world = self.estimator.process_tag(
-                    corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_world_id
-                )
-                r_obj, t_obj = self.estimator.process_tag(
-                    corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_object_id
-                )
-                r_ee, t_ee = self.estimator.process_tag(
-                    corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_ee_id
-                )
-                
-                # Update visibility flags
-                world_visible = False
-                object_visible = False
-                ee_visible = False
-                if ids is not None:
-                    ids_arr = np.atleast_1d(ids).ravel()
-                    world_visible = np.any(ids_arr == robot_config.aruco_world_id)
-                    object_visible = np.any(ids_arr == robot_config.aruco_object_id)
-                    ee_visible = np.any(ids_arr == robot_config.aruco_ee_id)
-                
-                obs['aruco_visibility'][0] = 1.0 if world_visible else 0.0
-                obs['aruco_visibility'][1] = 1.0 if object_visible else 0.0
-                obs['aruco_visibility'][2] = 1.0 if ee_visible else 0.0
-                
-                # Visualization
-                if self.show_video:
-                    if ids is not None:
-                        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-                    if self.show_axes:
-                        if r_world is not None:
-                            cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_world, t_world, AXIS_LENGTH)
-                        if r_obj is not None:
-                            cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_obj, t_obj, AXIS_LENGTH)
-                        if r_ee is not None:
-                            cv2.drawFrameAxes(frame, self.cam_matrix, self.dist_coeffs, r_ee, t_ee, AXIS_LENGTH)
-                    
-                    disp = cv2.resize(
-                        frame,
-                        (robot_config.camera_width // 2, robot_config.camera_height // 2)
-                    )
-                    cv2.imshow('Robot Camera View', disp)
-                    cv2.waitKey(1)
-                
-                # Compute relative poses
-                pos, quat = self._compute_relative_pose(r_world, t_world, r_ee, t_ee)
-                obs['aruco_ee_in_world'] = np.concatenate([pos, quat])
-                
-                pos, quat = self._compute_relative_pose(r_world, t_world, r_obj, t_obj)
-                obs['aruco_object_in_world'] = np.concatenate([pos, quat])
-                
-                if obs['aruco_visibility'][0] and obs['aruco_visibility'][1]:
-                    object_pose_data = obs['aruco_object_in_world']
-                    object_visible = 1.0
-                
-                pos, quat = self._compute_relative_pose(r_obj, t_obj, r_ee, t_ee)
-                obs['aruco_ee_in_object'] = np.concatenate([pos, quat])
-                
-                pos, quat = self._compute_relative_pose(r_ee, t_ee, r_obj, t_obj)
-                obs['aruco_object_in_ee'] = np.concatenate([pos, quat])
-        
-        # Record total camera processing time
-        total_camera_time = time.perf_counter() - camera_start
-        self.profiler.record_total_camera_time(total_camera_time, ret if self.camera else False)
-        
-        # Store latest observations
-        self.latest_aruco_obs = {k: v.copy() for k, v in obs.items()}
+        # Get latest frame for recording (thread-safe, captured by ArUco polling thread at camera FPS)
+        frame_to_record = None
+        if self.is_recording:
+            with self._aruco_lock:
+                if self._latest_frame_for_recording is not None:
+                    frame_to_record = self._latest_frame_for_recording.copy()
         
         # Recording logic
         if self.is_recording:
             if self.recording_start_time is None:
                 self.recording_start_time = time.perf_counter()
+                # Always enable frame recording when recording starts
+                self.record_frames = True
             
             ik_ee_position, ik_ee_orientation_quat_wxyz = self._get_current_ee_pose()
             ee_pose_target = np.concatenate([ik_ee_position, ik_ee_orientation_quat_wxyz])
@@ -613,6 +914,20 @@ class TeleopCameraControlEncoders(TeleopControl):
                     [gripper_target]
                 ])
                 current_step['augmented_actions'] = augmented_actions
+                
+                # Record camera frame (captured by ArUco polling thread at camera FPS, stored here at control frequency)
+                if self.record_frames:
+                    if frame_to_record is not None:
+                        # Store frame captured from ArUco polling thread
+                        current_step['camera_frame'] = frame_to_record
+                    else:
+                        # Store empty frame if recording but no frame available yet
+                        downscaled_height = robot_config.camera_height // robot_config.frame_downscale_factor
+                        downscaled_width = robot_config.camera_width // robot_config.frame_downscale_factor
+                        current_step['camera_frame'] = np.zeros(
+                            (downscaled_height, downscaled_width, 3),
+                            dtype=np.uint8
+                        )
         
         # Record control loop iteration timing
         iteration_time = time.perf_counter() - iteration_start
@@ -620,6 +935,29 @@ class TeleopCameraControlEncoders(TeleopControl):
     
     def shutdown(self):
         """Cleanup camera and print final statistics."""
+        # Stop ArUco polling thread
+        self._aruco_polling_active = False
+        if self._aruco_poll_thread is not None:
+            self._aruco_poll_thread.join(timeout=1.0)
+        
+        # Print frame storage statistics if recording
+        if self.is_recording and self.record_frames and self.trajectory:
+            num_frames = sum(1 for t in self.trajectory if 'camera_frame' in t)
+            if num_frames > 0:
+                # Frames are saved at 1/4 resolution (1/4 width, 1/4 height = 1/16 pixels)
+                downscaled_width = robot_config.camera_width // robot_config.frame_downscale_factor
+                downscaled_height = robot_config.camera_height // robot_config.frame_downscale_factor
+                frame_size_bytes = (downscaled_width * downscaled_height * 3)  # BGR uint8
+                frame_size_mb = frame_size_bytes / (1024 * 1024)
+                total_size_mb = num_frames * frame_size_mb
+                print(f"\n📹 Frame Storage Summary:")
+                print(f"  Frames recorded: {num_frames}")
+                print(f"  Frame resolution: {downscaled_width}x{downscaled_height} (1/{robot_config.frame_downscale_factor} of {robot_config.camera_width}x{robot_config.camera_height})")
+                print(f"  Frame size: {frame_size_mb:.3f} MB per frame (downscaled)")
+                print(f"  Total frame data: ~{total_size_mb:.1f} MB (uncompressed)")
+                print(f"  Note: NPZ compression will reduce file size significantly")
+                print(f"  Note: ArUco detection uses full-resolution frames (not downscaled)")
+        
         super().shutdown()
         if self.camera:
             self.camera.release()
@@ -678,6 +1016,9 @@ class TeleopCameraControlEncoders(TeleopControl):
                 print(f"  Efficiency: {efficiency:.1f}% of expected")
             print(f"{'='*60}\n")
         
+        # Print ArUco polling thread statistics
+        self.aruco_profiler.print_final_stats()
+        
         # Print final profiler stats (summary)
         final_stats = self.profiler.get_final_stats()
         if final_stats['total_iterations'] > 0:
@@ -690,6 +1031,9 @@ class TeleopCameraControlEncoders(TeleopControl):
                 print(f"  Missed deadlines: {final_stats['missed_deadlines']} ({cl_stats.get('missed_deadline_rate', 0):.1f}%)")
                 if cl_stats.get('actual_frequency', 0) > 0:
                     print(f"  Frequency: {cl_stats['actual_frequency']:.2f}Hz (target: {cl_stats['target_frequency']:.2f}Hz)")
+                if cl_stats.get('avg_iteration_time', 0) > 0:
+                    print(f"  Avg iteration time: {cl_stats['avg_iteration_time']:.2f}ms")
+                    print(f"    Note: ArUco detection now in separate thread (not included in this time)")
                 if final_stats['blocking_operations'] > 0:
                     blocking_pct = (final_stats['blocking_operations'] / final_stats['total_iterations']) * 100
                     print(f"  Blocking operations: {final_stats['blocking_operations']} ({blocking_pct:.1f}%)")
@@ -697,6 +1041,30 @@ class TeleopCameraControlEncoders(TeleopControl):
                 failure_rate = (final_stats['camera_read_failures'] / final_stats['camera_read_count']) * 100
                 if failure_rate > 0:
                     print(f"  Camera read failures: {final_stats['camera_read_failures']}/{final_stats['camera_read_count']} ({failure_rate:.1f}%)")
+            
+            # Frame operation statistics
+            if final_stats.get('frame_poll') is not None:
+                fp = final_stats['frame_poll']
+                print(f"\n📹 Frame Polling (camera.read()):")
+                print(f"  avg={fp['avg']:.2f}ms, min={fp['min']:.2f}ms, max={fp['max']:.2f}ms, p95={fp['p95']:.2f}ms, p99={fp['p99']:.2f}ms")
+                print(f"  count={fp['count']}")
+            
+            if final_stats.get('frame_storage') is not None:
+                fs = final_stats['frame_storage']
+                print(f"\n💾 Frame Storage (resize/copy):")
+                print(f"  avg={fs['avg']:.2f}ms, min={fs['min']:.2f}ms, max={fs['max']:.2f}ms, p95={fs['p95']:.2f}ms, p99={fs['p99']:.2f}ms")
+                print(f"  count={fs['count']}")
+            
+            if final_stats.get('total_frame_ops') is not None:
+                tfo = final_stats['total_frame_ops']
+                print(f"\n⏱️  Total Frame Operations (poll + storage):")
+                print(f"  avg={tfo['avg']:.2f}ms, min={tfo['min']:.2f}ms, max={tfo['max']:.2f}ms, p95={tfo['p95']:.2f}ms, p99={tfo['p99']:.2f}ms")
+                print(f"  count={tfo['count']}")
+                # Show percentage of outer loop budget used
+                outer_loop_budget = (1.0 / robot_config.control_frequency) * 1000  # Convert to ms
+                budget_pct = (tfo['avg'] / outer_loop_budget) * 100
+                print(f"  Avg frame ops use {budget_pct:.1f}% of outer loop budget ({outer_loop_budget:.1f}ms)")
+            
             print(f"{'='*60}\n")
         
         super().shutdown()

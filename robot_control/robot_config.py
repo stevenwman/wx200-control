@@ -57,7 +57,7 @@ class RobotConfig:
     # Robot control parameters
     velocity_limit: int = 40  # Speed limit for movements (0=Max, 30=Slow/Safe)
     control_frequency: float = 10.0  # Outer loop frequency (Hz) - teleop/policy/observations
-    inner_control_frequency: float = 150.0  # Inner loop frequency (Hz) - IK solving and motor commands
+    inner_control_frequency: float = 120.0  # Inner loop frequency (Hz) - IK solving and motor commands
     inner_loop_skip_threshold: float = 0.002  # Minimum time remaining before outer loop deadline to execute inner loop (seconds)
     use_threaded_control: bool = False  # If True, use separate threads for inner/outer loops (more responsive, but adds threading complexity)
     

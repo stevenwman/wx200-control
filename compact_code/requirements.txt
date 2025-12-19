@@ -1,0 +1,18 @@
+# python=3.12
+# Ubuntu 24.04
+mink
+mujoco
+numpy
+scipy
+pyspacemouse
+dynamixel-sdk
+matplotlib
+opencv-python
+plotly
+dash
+nbformat>=4.2.0
+ipywidgets
+quadprog
+loop-rate-limiters
+
+# conda install -c conda-forge pygobject

@@ -240,7 +240,7 @@ class TeleopControl(RobotControlBase):
                     
                     # Resend home position command periodically to ensure it's maintained
                     if current_time - last_command_time >= command_interval:
-                        if hasattr(self, '_driver_lock'):
+                        if hasattr(self, '_driver_lock') and self._driver_lock is not None:
                             with self._driver_lock:
                                 self.robot_driver.send_motor_positions(
                                     self.home_motor_positions, 
@@ -270,7 +270,7 @@ class TeleopControl(RobotControlBase):
                 # Sync MuJoCo to actual robot position after moving
                 time.sleep(0.1)
                 # Acquire driver lock to prevent race condition with inner control loop
-                if hasattr(self, '_driver_lock'):
+                if hasattr(self, '_driver_lock') and self._driver_lock is not None:
                     with self._driver_lock:
                         robot_encoders = self.robot_driver.read_all_encoders(max_retries=5, retry_delay=0.2)
                 else:
@@ -288,10 +288,13 @@ class TeleopControl(RobotControlBase):
                 if len(robot_joint_angles) > 5:
                     self.gripper_current_position = robot_joint_angles[5]
                     # Update shared gripper command so inner loop knows the new position
-                    if hasattr(self, '_command_lock'):
+                    if hasattr(self, '_command_lock') and self._command_lock is not None:
                         with self._command_lock:
                             self._latest_gripper_command = self.gripper_current_position
                             self.gripper_current_position = robot_joint_angles[5]
+                    else:
+                        # Single-threaded mode: directly update (no lock needed)
+                        self._latest_gripper_command = self.gripper_current_position
                 
                 print(f"✓ Robot moved to home position: {actual_position}", flush=True)
                 print("="*60 + "\n", flush=True)
@@ -312,7 +315,7 @@ class TeleopControl(RobotControlBase):
                 # 1) Reboot gripper motor to clear over-torque / error states
                 # Acquire driver lock to prevent race condition with inner control loop
                 try:
-                    if hasattr(self, '_driver_lock'):
+                    if hasattr(self, '_driver_lock') and self._driver_lock is not None:
                         with self._driver_lock:
                             self.robot_driver.reboot_motor(gripper_motor_id)
                     else:
@@ -332,7 +335,7 @@ class TeleopControl(RobotControlBase):
                 dxl_comm_result = None
                 for retry in range(max_torque_retries):
                     try:
-                        if hasattr(self, '_driver_lock'):
+                        if hasattr(self, '_driver_lock') and self._driver_lock is not None:
                             with self._driver_lock:
                                 dxl_comm_result, dxl_error = self.robot_driver.packetHandler.write1ByteTxRx(
                                     self.robot_driver.portHandler,
@@ -374,7 +377,7 @@ class TeleopControl(RobotControlBase):
                     # Send gripper open command multiple times to ensure it's maintained
                     for _ in range(3):
                         # Acquire driver lock to prevent race condition with inner control loop
-                        if hasattr(self, '_driver_lock'):
+                        if hasattr(self, '_driver_lock') and self._driver_lock is not None:
                             with self._driver_lock:
                                 self.robot_driver.send_motor_positions(
                                     {gripper_motor_id: gripper_open_encoder},
@@ -398,7 +401,7 @@ class TeleopControl(RobotControlBase):
                 # 3) Update internal gripper state to match open position
                 try:
                     # Acquire driver lock to prevent race condition with inner control loop
-                    if hasattr(self, '_driver_lock'):
+                    if hasattr(self, '_driver_lock') and self._driver_lock is not None:
                         with self._driver_lock:
                             robot_encoders = self.robot_driver.read_all_encoders(max_retries=3, retry_delay=0.1)
                     else:
@@ -409,10 +412,13 @@ class TeleopControl(RobotControlBase):
                         new_gripper_pos = encoder_to_gripper_position(robot_encoders[7])
                         self.gripper_current_position = new_gripper_pos
                         # Update shared gripper command so inner loop knows the new position
-                        if hasattr(self, '_command_lock'):
+                        if hasattr(self, '_command_lock') and self._command_lock is not None:
                             with self._command_lock:
                                 self._latest_gripper_command = new_gripper_pos
                                 self.gripper_current_position = new_gripper_pos
+                        else:
+                            # Single-threaded mode: directly update (no lock needed)
+                            self._latest_gripper_command = new_gripper_pos
                 except Exception:
                     # Non-fatal if we fail to read; next loop will converge from IK
                     pass
