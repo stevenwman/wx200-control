@@ -9,6 +9,8 @@ import os
 import time
 import cv2
 import numpy as np
+import threading
+from scipy.spatial.transform import Rotation as R
 from .robot_config import robot_config
 
 # Setup GStreamer paths for conda environments
@@ -290,3 +292,142 @@ class ArUcoPoseEstimator:
         T_rel = np.linalg.inv(T_ref) @ T_tgt
         r_rel, _ = cv2.Rodrigues(T_rel[:3,:3])
         return r_rel, T_rel[:3,3].reshape(3,1)
+
+
+class ThreadedArUcoCamera:
+    """
+    Threaded wrapper for Camera + ArUco Estimator.
+    Polls at camera FPS (30Hz) in background thread, decoupling it from control loop (10Hz).
+    """
+    def __init__(self, device=0, width=1920, height=1080, fps=30):
+        self.device = device
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.camera = None
+        self.detector = None
+        self.estimator = None
+        self.running = False
+        self.thread = None
+        self.lock = threading.Lock()
+        
+        # Latest data (Thread Safe)
+        self.latest_frame = None
+        self.latest_obs = {
+            'aruco_ee_in_world': np.zeros(7),
+            'aruco_object_in_world': np.zeros(7),
+            'aruco_ee_in_object': np.zeros(7),
+            'aruco_object_in_ee': np.zeros(7),
+            'aruco_visibility': np.zeros(3)
+        }
+        
+        # Init components
+        self.camera = Camera(device=device, width=width, height=height, fps=fps)
+        self.camera.start()
+        
+        self.estimator = ArUcoPoseEstimator(MARKER_SIZE)
+        self.cam_matrix, self.dist_coeffs = get_approx_camera_matrix(width, height)
+        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
+        parameters = cv2.aruco.DetectorParameters()
+        self.detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self.thread.start()
+        print(f"✓ Started ThreadedArUcoCamera polling at {self.fps}Hz")
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        if self.camera:
+            self.camera.release()
+
+    def release(self):
+        self.stop()
+
+    def _poll_loop(self):
+        # We manually limit rate to fps
+        dt = 1.0 / self.fps
+        
+        while self.running:
+            start = time.perf_counter()
+            
+            # 1. Read Frame
+            ret, frame = self.camera.read()
+            if not ret:
+                time.sleep(0.001)
+                continue
+                
+            # 2. Detect
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids, _ = self.detector.detectMarkers(gray)
+            
+            # 3. Process Tags
+            r_world, t_world = self.estimator.process_tag(corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_world_id)
+            r_obj, t_obj = self.estimator.process_tag(corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_object_id)
+            r_ee, t_ee = self.estimator.process_tag(corners, ids, self.cam_matrix, self.dist_coeffs, robot_config.aruco_ee_id)
+            
+            # 4. Compute Obs
+            obs = {}
+            # Visibility
+            world_vis = 1.0 if (ids is not None and robot_config.aruco_world_id in ids) else 0.0
+            obj_vis = 1.0 if (ids is not None and robot_config.aruco_object_id in ids) else 0.0
+            ee_vis = 1.0 if (ids is not None and robot_config.aruco_ee_id in ids) else 0.0
+            obs['aruco_visibility'] = np.array([world_vis, obj_vis, ee_vis])
+            
+            # Relative Poses
+            def pack(r, t): 
+                if r is None: return np.zeros(3), np.array([1.,0.,0.,0.])
+                R_mat, _ = cv2.Rodrigues(r)
+                quat = np.array([0,0,0,1]) # dummy
+                # We need proper conversion if using this helper, but ArUcoPoseEstimator has specific helper?
+                # ThreadedArUcoCamera should reuse logic. 
+                # Let's use self.estimator.get_relative_pose helper if possible? 
+                # Wait, I can't call a method I haven't defined on this class easily if I didn't copy it.
+                # ArUcoPoseEstimator.get_relative_pose IS defined in this file.
+                return np.zeros(3), np.array([1.,0.,0.,0.])
+
+            # Actually, let's copy the compute_relative_pose logic or move it to helper.
+            # Ideally ArUcoPoseEstimator shouldn't be responsible for "relative between two tags".
+            # It is in `camera.py` lines 280-292. `get_relative_pose` returns r_rel, t_rel.
+            # We need to convert to pos, quat_wxyz.
+            
+            def compute_rel(r1, t1, r2, t2):
+                if r1 is None or r2 is None: return np.zeros(7)
+                r_rel, t_rel = self.estimator.get_relative_pose(r1, t1, r2, t2)
+                R_rel, _ = cv2.Rodrigues(r_rel)
+                from scipy.spatial.transform import Rotation as R
+                q = R.from_matrix(R_rel).as_quat() # xyzw
+                return np.concatenate([t_rel.flatten(), [q[3], q[0], q[1], q[2]]])
+
+            obs['aruco_ee_in_world'] = compute_rel(r_world, t_world, r_ee, t_ee)
+            obs['aruco_object_in_world'] = compute_rel(r_world, t_world, r_obj, t_obj)
+            obs['aruco_ee_in_object'] = compute_rel(r_obj, t_obj, r_ee, t_ee)
+            obs['aruco_object_in_ee'] = compute_rel(r_ee, t_ee, r_obj, t_obj)
+            
+            # 5. Update Shared State
+            with self.lock:
+                self.latest_frame = frame.copy()
+                self.latest_obs = obs
+                # Draw markers on frame for Viz?
+                # Ideally we store "annotated frame" or "clean frame"?
+                # Legacy stored "frame_to_record" (clean, downscaled) and Viz showed annotated.
+                # Let's just store clean frame. Viz can annotate if needed, or we annotate a copy.
+                if ids is not None:
+                     cv2.aruco.drawDetectedMarkers(self.latest_frame, corners, ids)
+            
+            # Sleep remainder
+            elapsed = time.perf_counter() - start
+            if elapsed < dt:
+                time.sleep(dt - elapsed)
+
+    def get_data(self):
+        """Return latest frame and observation safely."""
+        with self.lock:
+            return (
+                self.latest_frame.copy() if self.latest_frame is not None else None, 
+                self.latest_obs.copy()
+            )
+
