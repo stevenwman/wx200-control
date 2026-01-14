@@ -221,24 +221,63 @@ class DemoCollector:
                 
                 # 4. Record Data
                 if self.is_recording:
-                    # Capture "True" state from hardware (accessed via env.robot_hardware)
-                    # This replicates "collect_demo_encoders" behavior of getting raw data
-                    hw = self.env.robot_hardware
-                    # We might want exact encoder values
-                    encoders = hw.robot_driver.read_all_encoders() # This might be getting stale if filtered... 
-                    # Actually RobotHardware.execute_command doesn't auto-read encoders every step 
-                    # unless we want closed loop. It does write command.
-                    # The legacy script polled encoders explicitly.
-                    # WX200GymEnv doesn't always poll encoders in step, it uses internal state 
-                    # OR if configured.
-                    # Let's rely on observation for now, or peek into hardware for true logging.
+                    # Construct data packet matching legacy keys EXACTLY
                     
+                    # 1. State/Qpos
+                    state = info.get('qpos', np.zeros(6))
+                    
+                    # 2. Encoders
+                    encoders = info.get('encoder_values', {})
+                    encoder_array = np.array([encoders.get(mid, 0) for mid in robot_config.motor_ids])
+                    
+                    # 3. EE Pose (FK)
+                    ee_pose_encoder = info.get('ee_pose_fk', np.zeros(7))
+                    
+                    # 4. Raw ArUco
+                    raw_aruco = info.get('raw_aruco', {})
+                    
+                    # 5. Augmented Actions
+                    # vel(3) + ang(3) + axis_angle(3) + grip(1) = 10D
+                    # gym action is normalized (8D). We save the UNNORMALIZED world command? 
+                    # Legacy saved:
+                    # 'velocity_world', 'angular_velocity_world', 'axis_angle', 'gripper_target'
+                    # Actually legacy saved:
+                    # 'action': np.concatenate([velocity_world, angular_velocity_world, [gripper_target]]) (7D)
+                    # 'augmented_actions': ... (10D)
+                    
+                    axis_angle = ang_vel_world * dt
+                    augmented_action = np.concatenate([
+                        vel_world, ang_vel_world, axis_angle, [self.current_gripper_pos]
+                    ])
+                    legacy_action = np.concatenate([
+                        vel_world, ang_vel_world, [self.current_gripper_pos]
+                    ])
+
                     step_data = {
                         'timestamp': time.time(),
-                        'observation': obs,
-                        'action': action,
-                        'qpos': hw.configuration.q.copy(), # Computed kinematic state
-                        # 'encoders': encoders # If we read them
+                        
+                        # Core State
+                        'state': state,
+                        'encoder_values': encoder_array,
+                        'ee_pose_encoder': ee_pose_encoder,
+                        
+                        # Actions
+                        'action': legacy_action,
+                        'augmented_actions': augmented_action,
+                        'ee_pose_target': np.zeros(7), # We don't have IK target readily available unless we assume it met FK? Set to FK for now.
+                        
+                        # Vision
+                        'object_pose': raw_aruco.get('aruco_object_in_world', np.zeros(7)),
+                        'object_visible': np.array([raw_aruco.get('aruco_visibility', np.zeros(3))[1]]),
+                        'aruco_ee_in_world': raw_aruco.get('aruco_ee_in_world', np.zeros(7)),
+                        'aruco_object_in_world': raw_aruco.get('aruco_object_in_world', np.zeros(7)),
+                        'aruco_ee_in_object': raw_aruco.get('aruco_ee_in_object', np.zeros(7)),
+                        'aruco_object_in_ee': raw_aruco.get('aruco_object_in_ee', np.zeros(7)),
+                        'aruco_visibility': raw_aruco.get('aruco_visibility', np.zeros(3)),
+                        
+                        # Frame (optional via flag, legacy had record_frames)
+                        # We grabbed self.env.last_frame
+                        'camera_frame': cv2.resize(self.env.last_frame, (robot_config.camera_width // 4, robot_config.camera_height // 4)) if self.env.last_frame is not None else np.zeros((270, 480, 3), dtype=np.uint8)
                     }
                     self.trajectory.append(step_data)
                 

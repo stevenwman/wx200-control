@@ -11,6 +11,8 @@ Based on wx200_robot_profile_camera.py but optimized for data collection with mi
 ArUco polling runs at camera FPS (30 Hz) for maximum update rate, while logging/storage
 happens at control frequency (10 Hz).
 """
+import fix_gstreamer_env  # Must be imported BEFORE cv2 and other modules that use GStreamer
+
 import cv2
 import numpy as np
 import argparse
@@ -1076,24 +1078,44 @@ def main():
     parser.add_argument('--camera-id', type=int, default=None, help='Camera device ID (defaults to robot_config.camera_id)')
     parser.add_argument('--no-vis', action='store_true', help='Disable video window')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose profiling output (disables warning-only mode)')
+    parser.add_argument('--skip-checks', action='store_true', help='Skip system pre-flight checks')
+    parser.add_argument('--auto-fix', action='store_true', help='Automatically fix USB latency if possible')
     args = parser.parse_args()
-    
+
+    # Run system pre-flight checks (unless skipped)
+    if not args.skip_checks:
+        from system_checks import run_system_checks, check_and_fix_usb_latency
+
+        camera_id = args.camera_id if args.camera_id is not None else robot_config.camera_id
+
+        # Check and optionally auto-fix USB latency
+        if args.auto_fix:
+            check_and_fix_usb_latency(device='/dev/ttyUSB0', auto_fix=True)
+
+        # Run all checks
+        run_system_checks(
+            camera_device_id=camera_id,
+            usb_device='/dev/ttyUSB0',
+            verbose=True,
+            require_all=False  # Don't fail, just warn
+        )
+
     # Override warning-only mode if verbose requested
     if args.verbose:
         robot_config.warning_only_mode = False
         robot_config.encoder_poll_stats_interval = 100
         robot_config.control_perf_stats_interval = 500
-    
+
     # Create and run
     controller = TeleopCameraControlEncoders(
         enable_recording=True,  # Always enable recording capability; GUI decides when to actually record
         output_path=args.output,
         camera_id=args.camera_id
     )
-    
+
     if args.no_vis:
         controller.show_video = False
-        
+
     controller.run()
 
 

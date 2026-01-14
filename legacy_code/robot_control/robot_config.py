@@ -92,7 +92,7 @@ class RobotConfig:
     # Vision / camera configuration
     # Note: camera_id maps to /dev/video{camera_id}
     # Use: v4l2-ctl --list-devices to find your camera
-    camera_id: int = 2 # Changed from 1 to 2 (maps to /dev/video2 for UC70 camera)
+    camera_id: int = 99 # UC70 camera capture device (video1 is capture, video2 is metadata)
     camera_width: int = 1920
     camera_height: int = 1080
     camera_fps: int = 30

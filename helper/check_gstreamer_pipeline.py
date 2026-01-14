@@ -9,6 +9,7 @@ Usage:
     python check_gstreamer_pipeline.py --test              # Test pipeline with a few frames
 """
 
+import fix_gstreamer_env  # Must be imported BEFORE camera module
 import argparse
 import sys
 import time

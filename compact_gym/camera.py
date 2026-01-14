@@ -7,22 +7,17 @@ OpenCV fallback has been removed to ensure high performance (30 FPS vs 15 FPS).
 import sys
 import os
 import time
+from pathlib import Path
+
+# Fix GStreamer environment before any imports that use it
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import fix_gstreamer_env  # Must be imported BEFORE cv2 and GStreamer
+
 import cv2
 import numpy as np
 import threading
 from scipy.spatial.transform import Rotation as R
 from .robot_config import robot_config
-
-# Setup GStreamer paths for conda environments
-system_typelib_paths = [
-    '/usr/lib/x86_64-linux-gnu/girepository-1.0',
-    '/usr/lib/girepository-1.0',
-    '/usr/share/gir-1.0'
-]
-for path in system_typelib_paths:
-    if os.path.exists(path) and 'GI_TYPELIB_PATH' not in os.environ:
-        current_path = os.environ.get('GI_TYPELIB_PATH', '')
-        os.environ['GI_TYPELIB_PATH'] = f"{path}:{current_path}" if current_path else path
 
 try:
     import gi
