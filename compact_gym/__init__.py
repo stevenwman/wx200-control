@@ -1,9 +1,9 @@
 """
 Compact Gym Environment for WX200 Robot.
+
+For deployment, use:
+    from deployment.gym_env import WX200GymEnv
+    from deployment.robot_config import robot_config
 """
 
-from .gym_env import WX200GymEnv
-from .robot_config import robot_config
-from .robot_hardware import RobotHardware
-
-__all__ = ['WX200GymEnv', 'robot_config', 'RobotHardware']
+__all__ = ['deployment', 'collection']
