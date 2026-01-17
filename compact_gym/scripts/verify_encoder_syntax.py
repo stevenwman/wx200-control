@@ -17,12 +17,16 @@ print()
 files_to_check = [
     'robot_hardware.py',
     'gym_env.py',
+    'collect_demo_gym.py',
 ]
 
 all_passed = True
 
 for filename in files_to_check:
-    filepath = Path(__file__).parent.parent / 'deployment' / filename
+    if filename == 'collect_demo_gym.py':
+        filepath = Path(__file__).parent.parent / filename
+    else:
+        filepath = Path(__file__).parent.parent / 'deployment' / filename
     print(f"Checking {filename}...")
 
     try:
@@ -70,21 +74,23 @@ for filename in files_to_check:
 
         # Check for specific patterns in gym_env.py
         elif filename == 'gym_env.py':
-            found_poll_call = False
             found_encoder_in_info = False
 
             source_lower = source.lower()
-            if 'poll_encoders' in source_lower:
-                found_poll_call = True
-                print(f"    ✓ poll_encoders() call found in step()")
             if 'encoder_values' in source_lower and 'info[' in source_lower:
                 found_encoder_in_info = True
                 print(f"    ✓ Encoder data added to info dict")
 
-            if not found_poll_call:
-                print(f"    ⚠ poll_encoders() call not found")
             if not found_encoder_in_info:
                 print(f"    ⚠ Encoder data in info dict not found")
+
+        # Check for encoder polling in teleop layer
+        elif filename == 'collect_demo_gym.py':
+            source_lower = source.lower()
+            if 'poll_encoders' in source_lower:
+                print(f"    ✓ poll_encoders() call found in teleop loop")
+            else:
+                print(f"    ⚠ poll_encoders() call not found in teleop loop")
 
         print(f"    ✓ {filename} syntax valid")
 

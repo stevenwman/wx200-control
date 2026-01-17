@@ -4,10 +4,7 @@ Verification Script: Teleop via WX200GymEnv.
 Recreates the teleoperation workflow using the new Gym environment and
 SpaceMouse driver.
 """
-import sys
-import time
 import numpy as np
-from pathlib import Path
 
 from deployment.gym_env import WX200GymEnv
 from deployment.robot_config import robot_config
@@ -37,7 +34,7 @@ def main():
     
     try:
         print("\nResetting environment (Moving to Home)...")
-        obs, _ = env.reset()
+        env.reset()
         print("Ready! Control the robot with SpaceMouse.")
         print("Press Ctrl+C to exit.")
         
@@ -75,9 +72,7 @@ def main():
             action = np.concatenate([norm_vel, norm_ang_vel, [norm_gripper]])
             
             # 5. Step Environment
-            obs, _, _, _, _ = env.step(action)
-            
-            # Rate limiting handled inside env.step()
+            env.step(action)
             
     except KeyboardInterrupt:
         print("\nStopping...")
@@ -87,7 +82,6 @@ def main():
         traceback.print_exc()
     finally:
         env.close()
-        if env.robot_hardware: env.robot_hardware.shutdown()
         spacemouse.stop()
 
 if __name__ == "__main__":

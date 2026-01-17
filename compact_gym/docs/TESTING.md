@@ -14,7 +14,7 @@ python collect_demo_gym.py
 **What to verify:**
 - ✓ Robot initializes and homes
 - ✓ SpaceMouse controls work smoothly
-- ✓ Recording starts/stops correctly (`r`, `d`, `x` keys)
+- ✓ Recording starts/stops correctly via GUI buttons
 - ✓ Shutdown is clean (Ctrl+C)
 
 ### Demo Validation
@@ -68,14 +68,15 @@ python scripts/verify_teleop_gym.py
 - [ ] Control frequency ~120Hz (check profiling output)
 
 ### Recording
-- [ ] `r` key starts recording (red status)
-- [ ] `d` key saves demo (green status)
-- [ ] `x` key discards demo
+- [ ] Start Recording button starts recording (red status)
+- [ ] Stop & Save button saves demo (green status)
+- [ ] Stop & Discard button discards demo
 - [ ] NPZ file created in `data/gym_demos/`
 - [ ] Validation passes for recorded demo
+- [ ] `smoothed_aruco_*` keys present in saved demo (in-place)
 
 ### Shutdown
-- [ ] `q` key exits cleanly
+- [ ] Close GUI window exits cleanly
 - [ ] Ctrl+C triggers proper cleanup
 - [ ] Robot returns to home
 - [ ] Motors disable (torque off)

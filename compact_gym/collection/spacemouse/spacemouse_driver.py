@@ -41,6 +41,7 @@ class SpaceMouseDriver:
         # Internal: multiprocessing setup
         self.data_queue = mp.Queue(maxsize=5)
         self.spacemouse_proc = None
+        self.stop_event = mp.Event()
         self.left_button_prev = False
         self.right_button_prev = False
         
@@ -52,9 +53,10 @@ class SpaceMouseDriver:
     
     def start(self):
         """Start the SpaceMouse reader process."""
+        self.stop_event.clear()
         self.spacemouse_proc = mp.Process(
             target=spacemouse_process,
-            args=(self.data_queue, self.velocity_scale, self.angular_velocity_scale)
+            args=(self.data_queue, self.velocity_scale, self.angular_velocity_scale, self.stop_event)
         )
         self.spacemouse_proc.start()
         print("SpaceMouse driver started")
@@ -65,8 +67,11 @@ class SpaceMouseDriver:
     def stop(self):
         """Stop the SpaceMouse reader process."""
         if self.spacemouse_proc is not None:
-            self.spacemouse_proc.terminate()
-            self.spacemouse_proc.join()
+            self.stop_event.set()
+            self.spacemouse_proc.join(timeout=1.0)
+            if self.spacemouse_proc.is_alive():
+                self.spacemouse_proc.terminate()
+                self.spacemouse_proc.join(timeout=1.0)
             self.spacemouse_proc = None
         print("SpaceMouse driver stopped")
     

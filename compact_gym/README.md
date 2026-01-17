@@ -38,7 +38,7 @@ python collection/validate_demo.py --all
 
 - **[docs/overview/ARCHITECTURE.md](docs/overview/ARCHITECTURE.md)** - System architecture and design
   - Clean layer separation (teleop → env → hardware)
-  - Input-agnostic design (works with SpaceMouse, NN, keyboard)
+  - Input-agnostic design (works with SpaceMouse, NN)
   - Dual-frequency control (120Hz motor commands, 10Hz data collection)
   - Data flow diagrams and verification
 
@@ -119,14 +119,40 @@ Collected demos are saved as NPZ files in `data/gym_demos/` with the following s
     'encoder_values': int[T, 7],     # Raw encoder values
     'ee_pose_encoder': float[T, 7],  # EE pose from FK (pos + quat)
     'action': float[T, 7],           # Velocity commands (unnormalized)
+    'action_normalized': float[T, 7], # Normalized action in [-1, 1]
     'augmented_actions': float[T, 10], # With axis-angle integration
     'ee_pose_target': float[T, 7],   # IK target pose
-    'aruco_*': float[T, 7],          # ArUco marker observations
+    'object_pose': float[T, 7],      # Object pose in world (if visible)
+    'object_visible': float[T, 1],   # Object visibility flag
+    'aruco_ee_in_world': float[T, 7],
+    'aruco_object_in_world': float[T, 7],
+    'aruco_ee_in_object': float[T, 7],
+    'aruco_object_in_ee': float[T, 7],
+    'aruco_visibility': float[T, 3],
     'camera_frame': uint8[T, 270, 480, 3]  # RGB frames (downscaled)
+    'smoothed_aruco_*': float[T, 7], # Added in-place after save (if enabled)
+    'metadata': dict                # created_at, file_name, config_snapshot
 }
 ```
 
 See [collection/validate_demo.py](collection/validate_demo.py) for validation checks.
+
+### Trajectory Viewer
+
+```bash
+python trajectory_viewer_gui.py
+```
+
+Loads demos from `data/gym_demos/` and can render a video from `camera_frame`.
+
+### Dataset Compilation (for training)
+
+```bash
+python merge_smoothed_trajectories.py data/gym_demos -o gym/hardware/merged_data_aruco_pos_ac_targets.npz
+```
+
+This produces a merged dataset with `observations`, `smoothed_observations`,
+`actions_flat`, `next_observations`, `rewards`, `terminals`, and `masks`.
 
 ## Requirements
 

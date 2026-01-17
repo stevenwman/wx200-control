@@ -58,9 +58,6 @@ def main():
         # Cleanup
         print("Closing environment...")
         env.close()
-        # Explicitly call shutdown on hardware if needed (env.close should ideally do this)
-        if env.robot_hardware:
-             env.robot_hardware.shutdown()
 
 if __name__ == "__main__":
     main()

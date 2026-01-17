@@ -35,6 +35,7 @@ def validate_demo(npz_path):
         'aruco_ee_in_object', 'aruco_object_in_ee', 'aruco_visibility',
         'camera_frame'
     ]
+    optional_fields = ['action_normalized', 'metadata']
 
     print("Field Check:")
     all_fields_present = True
@@ -50,6 +51,15 @@ def validate_demo(npz_path):
     if not all_fields_present:
         print("\n✗ Validation FAILED: Missing fields")
         return False
+
+    # Optional fields (warn only)
+    for field in optional_fields:
+        if field in data:
+            shape = data[field].shape if hasattr(data[field], 'shape') else 'scalar'
+            dtype = getattr(data[field], 'dtype', type(data[field]))
+            print(f"  ✓ {field:25s} shape={shape} dtype={dtype} (optional)")
+        else:
+            print(f"  ⚠ {field:25s} MISSING (optional)")
 
     print()
 
@@ -110,15 +120,16 @@ def validate_demo(npz_path):
 
     # 6. ArUco visibility stats
     visibility = data['aruco_visibility']
-    ee_visible_pct = np.mean(visibility[:, 0]) * 100
+    # Order is [world, object, ee]
+    world_visible_pct = np.mean(visibility[:, 0]) * 100
     obj_visible_pct = np.mean(visibility[:, 1]) * 100
-    world_visible_pct = np.mean(visibility[:, 2]) * 100
+    ee_visible_pct = np.mean(visibility[:, 2]) * 100
 
     print()
     print("ArUco Visibility:")
-    print(f"  EE marker:     {ee_visible_pct:5.1f}% visible")
-    print(f"  Object marker: {obj_visible_pct:5.1f}% visible")
     print(f"  World marker:  {world_visible_pct:5.1f}% visible")
+    print(f"  Object marker: {obj_visible_pct:5.1f}% visible")
+    print(f"  EE marker:     {ee_visible_pct:5.1f}% visible")
 
     if obj_visible_pct < 50:
         print(f"  ⚠ Object marker visibility low ({obj_visible_pct:.1f}%)")

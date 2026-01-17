@@ -89,6 +89,7 @@ class RobotConfig:
     warning_only_mode: bool = True  # If True, only print warnings when thresholds exceeded
     encoder_poll_stats_interval: int = 100  # Print encoder poll stats every N polls (0 = disable)
     control_perf_stats_interval: int = 500  # Print control step stats every N steps (0 = disable)
+    control_perf_window_sec: float = 3.0  # Rolling window for avg stats (seconds)
     
     # Vision / camera configuration
     # Note: camera_id maps to /dev/video{camera_id}
@@ -106,7 +107,8 @@ class RobotConfig:
     aruco_axis_length_scale: float = 0.5  # fraction of marker size for axis length
     aruco_single_tag_rotation_threshold: float = 0.8
     aruco_single_tag_translation_threshold: float = 0.2
-    aruco_max_preserve_frames: int = 8
+    # 0 = hold last valid pose indefinitely, >0 = max frames to preserve
+    aruco_max_preserve_frames: int = 0
     aruco_max_rejections_before_force: int = 5
     
     # End-effector workspace bounds (meters) for safety clamping

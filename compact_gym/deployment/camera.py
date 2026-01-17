@@ -4,10 +4,7 @@ Camera and ArUco pose estimation module.
 Combines GStreamer-based camera access (MANDATORY) and ArUco marker detection.
 OpenCV fallback has been removed to ensure high performance (30 FPS vs 15 FPS).
 """
-import sys
-import os
 import time
-from pathlib import Path
 
 # Fix GStreamer environment before any imports that use it
 from . import fix_gstreamer_env  # Must be imported BEFORE cv2 and GStreamer
@@ -61,6 +58,7 @@ class GStreamerCamera:
         self.appsink = None
         self.frame = None
         self.frame_available = False
+        self._frame_lock = threading.Lock()
         
     def _on_new_sample(self, appsink):
         """Callback when a new frame is available."""
@@ -76,8 +74,9 @@ class GStreamerCamera:
                     buffer=map_info.data,
                     dtype=np.uint8
                 )
-                self.frame = arr.copy()
-                self.frame_available = True
+                with self._frame_lock:
+                    self.frame = arr.copy()
+                    self.frame_available = True
                 buffer.unmap(map_info)
             return Gst.FlowReturn.OK
         return Gst.FlowReturn.ERROR
@@ -117,10 +116,11 @@ class GStreamerCamera:
         Read a frame (non-blocking).
         Returns (success, frame).
         """
-        if self.frame_available:
-            frame = self.frame.copy()
-            self.frame_available = False
-            return True, frame
+        with self._frame_lock:
+            if self.frame_available:
+                frame = self.frame.copy()
+                self.frame_available = False
+                return True, frame
         return False, None
     
     def release(self):
@@ -194,10 +194,11 @@ class ArUcoPoseEstimator:
         
         # 1. Handle Missing
         if len(idx) == 0:
-            if (state['last_valid_rvec'] is not None and 
-                state['consecutive_misses'] < MAX_PRESERVE_FRAMES):
+            if state['last_valid_rvec'] is not None:
                 state['consecutive_misses'] += 1
-                return state['last_valid_rvec'], state['last_valid_tvec']
+                # Hold last valid pose until updated (visibility still indicates missing)
+                if MAX_PRESERVE_FRAMES <= 0 or state['consecutive_misses'] <= MAX_PRESERVE_FRAMES:
+                    return state['last_valid_rvec'], state['last_valid_tvec']
             return None, None
 
         # 2. Get Candidates

@@ -381,12 +381,13 @@ See [docs/overview/ACTION_SPACE_NOTES.md](overview/ACTION_SPACE_NOTES.md) for mo
 - Recording state machine (ready/recording/paused)
 - Saves demos as NPZ files
 - Usage: `python collect_demo_gym.py`
-- **Keyboard controls**:
-  - `r` - Start recording
-  - `d` - Save demo
-  - `x` - Discard demo
-  - `h` - Home robot
-  - `q` - Quit
+- **GUI controls**:
+  - Start Recording - begin new demo
+  - Stop & Save - save demo
+  - Stop & Discard - discard demo
+  - Home - move to home pose
+  - Reset EE - reboot/open gripper
+  - Close GUI window - quit
 
 **scripts/verify_teleop_gym.py** (156 lines)
 - Tests teleoperation without recording
@@ -411,13 +412,13 @@ Demonstrations are saved as NumPy NPZ files in `data/gym_demos/`:
     'timestamp': float[T],              # Wall clock timestamps (seconds)
 
     # Robot state
-    'qpos': float[T, 6],               # Joint positions (radians)
-    'qvel': float[T, 6],               # Joint velocities (rad/s)
-    'gripper_pos': float[T],           # Gripper position (0-1)
-    'ee_pose': float[T, 7],            # End-effector pose [x,y,z, qx,qy,qz,qw]
+    'state': float[T, 6],              # Joint angles from encoders
+    'encoder_values': int[T, 7],       # Raw encoder values
+    'ee_pose_encoder': float[T, 7],    # EE pose from FK [x,y,z, qw,qx,qy,qz]
 
     # Actions (denormalized velocity commands)
     'action': float[T, 7],             # [v_x, v_y, v_z, ω_x, ω_y, ω_z, gripper]
+    'action_normalized': float[T, 7],  # Normalized action in [-1, 1]
 
     # Augmented actions (with axis-angle integration)
     'augmented_actions': float[T, 10], # Actions + integrated orientation
@@ -426,12 +427,22 @@ Demonstrations are saved as NumPy NPZ files in `data/gym_demos/`:
     'ee_pose_target': float[T, 7],     # Target pose sent to IK solver
 
     # ArUco markers (if enabled)
-    'aruco_0': float[T, 7],            # Marker 0 pose [x,y,z, qx,qy,qz,qw]
-    'aruco_1': float[T, 7],            # Marker 1 pose
-    # ... (one per marker ID)
+    'object_pose': float[T, 7],        # Object pose in world (if visible)
+    'object_visible': float[T, 1],     # Object visibility flag
+    'aruco_ee_in_world': float[T, 7],
+    'aruco_object_in_world': float[T, 7],
+    'aruco_ee_in_object': float[T, 7],
+    'aruco_object_in_ee': float[T, 7],
+    'aruco_visibility': float[T, 3],
 
     # Camera (if enabled)
     'camera_frame': uint8[T, 270, 480, 3]  # RGB frames (downscaled from 1920x1080)
+
+    # Smoothing (added in-place after save)
+    'smoothed_aruco_*': float[T, 7],
+
+    # Metadata
+    'metadata': dict,                  # created_at, file_name, config_snapshot
 }
 ```
 
@@ -597,9 +608,8 @@ This is normal and expected behavior.
 ```bash
 python collect_demo_gym.py
 # - Move robot with SpaceMouse
-# - Press 'r' to start recording
-# - Press 'd' to save
-# - Press 'q' to quit
+# - Use GUI buttons to start/save/discard
+# - Close GUI to quit
 ```
 
 **Test 2: Validate collected data**
@@ -638,14 +648,15 @@ See [docs/TESTING.md](TESTING.md) for comprehensive testing procedures.
 - [ ] Control frequency ~120Hz (check profiling output)
 
 **Recording checks**:
-- [ ] `r` key starts recording (red status)
-- [ ] `d` key saves demo (green status)
-- [ ] `x` key discards demo
+- [ ] Start Recording button starts recording (red status)
+- [ ] Stop & Save button saves demo (green status)
+- [ ] Stop & Discard button discards demo
 - [ ] NPZ file created in `data/gym_demos/`
 - [ ] Validation passes for recorded demo
+- [ ] `smoothed_aruco_*` keys present (in-place)
 
 **Shutdown checks**:
-- [ ] `q` key exits cleanly
+- [ ] Close GUI window exits cleanly
 - [ ] Ctrl+C triggers proper cleanup
 - [ ] Robot returns to home
 - [ ] Motors disable (torque off)
@@ -948,7 +959,7 @@ ArUco detection (~30ms) would block the 120Hz control loop. Background thread:
 - Encoder reading is slow (~8-12ms)
 - ArUco updates are 30Hz, no need to check faster
 - Recording at 10Hz is sufficient for imitation learning
-- User input (keyboard) doesn't need faster polling
+- User input (GUI) doesn't need faster polling
 
 **Result**: Smooth robot motion, responsive control, efficient data collection.
 

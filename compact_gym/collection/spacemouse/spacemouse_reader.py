@@ -6,7 +6,6 @@ import logging
 import sys
 import os
 import pyspacemouse
-import multiprocessing as mp
 import queue
 import time
 import numpy as np
@@ -38,7 +37,7 @@ class SpaceMouseReader:
         """Callback for button state changes. buttons is a list where 1 = pressed, 0 = released."""
         self.button_state = buttons.copy() if buttons else []
     
-    def start(self):
+    def start(self, stop_event=None):
         """Start reading from spacemouse and putting commands in queue"""
         # Suppress stdout during device discovery to hide "SpaceMouse Wireless found" messages
         original_stdout = sys.stdout
@@ -57,7 +56,7 @@ class SpaceMouseReader:
         self.button_state = []
         print("SpaceMouse reader started")
         
-        while self.running:
+        while self.running and (stop_event is None or not stop_event.is_set()):
             try:
                 state = pyspacemouse.read()
                 if state:
@@ -99,10 +98,10 @@ class SpaceMouseReader:
         self.running = False
 
 
-def spacemouse_process(data_queue, translation_scale, rotation_scale):
+def spacemouse_process(data_queue, translation_scale, rotation_scale, stop_event=None):
     """Process function for multiprocessing"""
     reader = SpaceMouseReader(data_queue, translation_scale, rotation_scale)
     try:
-        reader.start()
+        reader.start(stop_event=stop_event)
     except KeyboardInterrupt:
         reader.stop()

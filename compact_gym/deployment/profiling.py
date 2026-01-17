@@ -64,12 +64,14 @@ class LightweightProfiler:
     def __init__(self, window_size=None):
         self.window_size = window_size or robot_config.profiler_window_size
         self.control_loop_iteration_times = deque(maxlen=self.window_size)
+        self.control_loop_iteration_timestamps = deque(maxlen=self.window_size)
         self.last_control_loop_timestamp = None
         self.missed_deadlines = 0
         self.total_iterations = 0
         
     def record_control_loop_iteration(self, elapsed_time):
         self.control_loop_iteration_times.append(elapsed_time)
+        self.control_loop_iteration_timestamps.append(time.perf_counter())
         self.total_iterations += 1
         
         # Update timestamp
@@ -79,8 +81,21 @@ class LightweightProfiler:
         """Print Control Loop Stats."""
         if len(self.control_loop_iteration_times) < 10:
             return
-            
-        times_ms = [t * 1000 for t in self.control_loop_iteration_times]
+
+        window_sec = robot_config.control_perf_window_sec
+        if window_sec and window_sec > 0:
+            now = time.perf_counter()
+            times = [
+                t for t, ts in zip(self.control_loop_iteration_times, self.control_loop_iteration_timestamps)
+                if ts >= now - window_sec
+            ]
+        else:
+            times = list(self.control_loop_iteration_times)
+
+        if len(times) < 10:
+            return
+
+        times_ms = [t * 1000 for t in times]
         avg_time = np.mean(times_ms)
         max_time = np.max(times_ms)
         

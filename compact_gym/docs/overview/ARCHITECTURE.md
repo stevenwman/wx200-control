@@ -533,7 +533,7 @@ env.step(action)  # Doesn't know this came from joystick
 │       ↓                                                          │
 │  Estimate poses                                                  │
 │       ↓                                                          │
-│  Update env.aruco_obs_dict (thread-safe)                         │
+│  Update env.latest_aruco_obs + env.last_frame (thread-safe)       │
 │       ↓                                                          │
 │  Read by env.step() when building info dict                      │
 │                                                                  │
@@ -570,15 +570,15 @@ env.step(action)  # Doesn't know this came from joystick
 
 ### ✅ Hardware Abstraction
 
-**Claim**: Lower-level control is wrapped and hidden
+**Claim**: Lower-level control is centralized in `RobotHardware` and accessed via env helpers
 
 **Evidence**:
-- Teleop layer never calls `robot_driver` or `robot_controller` directly
-- All hardware access goes through `env.step()` or `env.reset()`
-- [collect_demo_gym.py](collect_demo_gym.py) imports `WX200GymEnv`, not `RobotDriver`
-- Motor commands happen inside `env.step()` → `robot_hardware.execute_command()`
+- Motor commands still happen inside `env.step()` → `robot_hardware.execute_command()`
+- Teleop uses `env.step()` for motion and reads `info` for recording
+- Teleop calls `env.poll_encoders()` in the outer loop to refresh cached encoder state
+- Teleop uses `env.home()` / `env.reset_gripper()` helpers (no direct driver access)
 
-**Conclusion**: ✅ VERIFIED - Hardware is properly abstracted
+**Conclusion**: ✅ VERIFIED - Teleop only touches env helpers; hardware logic stays centralized
 
 ### ✅ Action Normalization
 
@@ -599,10 +599,10 @@ env.step(action)  # Doesn't know this came from joystick
 **Evidence**:
 - [gym_env.py:468-479](gym_env.py#L468-L479): info dict populated with encoders, FK, ArUco
 - [collect_demo_gym.py:311-365](collect_demo_gym.py#L311-L365): Recording extracts from info dict
-- No direct `robot_hardware.poll_encoders()` calls in teleop layer
-- Info dict is the **data bridge** between env and recorder
+- Teleop triggers `env.poll_encoders()` once per outer loop to refresh cached encoder state
+- Info dict remains the **data bridge** between env and recorder
 
-**Conclusion**: ✅ VERIFIED - Info dict pattern properly implemented
+**Conclusion**: ✅ VERIFIED - Info dict pattern implemented with explicit encoder polling
 
 ### ✅ No Pollution
 
@@ -610,7 +610,7 @@ env.step(action)  # Doesn't know this came from joystick
 
 **Evidence**:
 - gym_env.py: No GUI, no SpaceMouse, no NPZ writing
-- collect_demo_gym.py: No IK solving, no motor commands, no FK
+- collect_demo_gym.py: No IK solving or FK; all hardware access goes through env helpers
 - Clear interface: `action_in → step() → (obs, reward, done, info)_out`
 - Teleop calls env, env doesn't call teleop (unidirectional dependency)
 
@@ -630,7 +630,7 @@ env.step(action)  # Doesn't know this came from joystick
 **Key architectural wins**:
 - ✅ env.step() is completely input-agnostic (works with any action source)
 - ✅ Recording logic cleanly separated (uses info dict pattern)
-- ✅ Hardware abstraction prevents direct driver access
+- ✅ Hardware abstraction is centralized with env helpers
 - ✅ Normalized action space ([-1, 1] standard for RL)
 - ✅ Dual-frequency control matches compact_code (120Hz motor, 10Hz data)
 - ✅ No pollution between layers (clean interfaces)

@@ -92,7 +92,7 @@ class RobotHardware:
         self.configuration = mink.Configuration(self.model)
         
         # Get sim home pose
-        home_qpos, home_position, home_orientation_quat_wxyz = get_sim_home_pose(self.model)
+        home_qpos, _, home_orientation_quat_wxyz = get_sim_home_pose(self.model)
         
         # Connect to robot
         self.robot_driver = RobotDriver()
@@ -300,6 +300,49 @@ class RobotHardware:
         
         # Update local gripper state
         self.gripper_current_position = gripper_target
+
+    def reset_gripper(self):
+        """Reboot and open the gripper, updating local state."""
+        if not self.initialized:
+            raise RuntimeError("RobotHardware not initialized (call initialize() first)")
+
+        gripper_id = robot_config.motor_ids[-1]
+        try:
+            self.robot_driver.reboot_motor(gripper_id)
+            time.sleep(0.5)
+            self.robot_driver.send_motor_positions({gripper_id: robot_config.gripper_encoder_max})
+            time.sleep(1.0)
+        except Exception as e:
+            print(f"Gripper reset warning: {e}")
+
+        self.gripper_current_position = robot_config.gripper_open_pos
+
+    def home(self):
+        """Move to home position and sync controller state."""
+        if not self.initialized:
+            raise RuntimeError("RobotHardware not initialized (call initialize() first)")
+
+        gripper_id = robot_config.motor_ids[-1]
+        if robot_config.startup_home_positions:
+            home_pos = {mid: pos for mid, pos in zip(robot_config.motor_ids, robot_config.startup_home_positions)}
+            home_pos[gripper_id] = robot_config.gripper_encoder_max
+            self.robot_driver.move_to_home(home_pos, velocity_limit=robot_config.velocity_limit)
+
+        robot_encoders = self.robot_driver.read_all_encoders()
+        _, act_pos, act_quat = sync_robot_to_mujoco(
+            robot_encoders, self.translator, self.model, self.data, self.configuration
+        )
+
+        self.robot_controller.reset_pose(act_pos, act_quat)
+        self.robot_controller.end_effector_task.set_target(
+            self.robot_controller.get_target_pose()
+        )
+        self.gripper_current_position = robot_config.gripper_open_pos
+
+    def emergency_stop(self):
+        """Disable torque on all motors immediately."""
+        if self.robot_driver and self.robot_driver.connected:
+            self.robot_driver.disable_torque_all()
 
     def get_encoder_state(self):
         """

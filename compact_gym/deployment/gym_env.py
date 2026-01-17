@@ -4,6 +4,7 @@ Gym environment for WX200 robot (Compact Version).
 Uses RobotHardware for direct control and OpenCV/ArUco for observations.
 """
 import time
+from collections import deque
 import threading
 import cv2
 import numpy as np
@@ -56,7 +57,6 @@ class WX200GymEnv(gym.Env):
         self.enable_aruco = enable_aruco
         self.show_video = show_video
         self.show_axes = show_axes
-        self.min_step_interval = 1.0 / self.control_frequency
         
         self.has_authority = False
         self.robot_hardware = None # Instance of RobotHardware
@@ -72,12 +72,12 @@ class WX200GymEnv(gym.Env):
         self.camera_width = width if width is not None else robot_config.camera_width
         self.camera_height = height if height is not None else robot_config.camera_height
         self.aruco_obs_dict = {}
-        self.prev_aruco_obs_dict = {}
 
         # ArUco background thread (runs at camera FPS)
         self._aruco_polling_active = False
         self._aruco_poll_thread = None
         self._aruco_lock = threading.Lock()  # Protects latest_aruco_obs updates
+        self._frame_lock = threading.Lock()  # Protects last_frame updates
         self.latest_aruco_obs = {
             'aruco_ee_in_world': np.zeros(7),
             'aruco_object_in_world': np.zeros(7),
@@ -87,6 +87,7 @@ class WX200GymEnv(gym.Env):
         }
 
         self.profiler = ArUcoProfiler() if robot_config.profiler_window_size > 0 else None
+        self._step_timing_samples = deque()
         
         # Spaces
         self.action_space = Box(
@@ -103,7 +104,6 @@ class WX200GymEnv(gym.Env):
         )
         
         self.episode_step = 0
-        self.last_step_time = None
     
     def _initialize_hardware(self, camera_id=None, width=None, height=None, fps=None):
         """Lazily initialize robot and camera hardware."""
@@ -248,7 +248,8 @@ class WX200GymEnv(gym.Env):
             # Update latest observations (thread-safe)
             with self._aruco_lock:
                 self.latest_aruco_obs = {k: v.copy() for k, v in obs.items()}
-                # Store latest frame for rendering
+            # Store latest frame for rendering (separate lock to reduce contention)
+            with self._frame_lock:
                 self.last_frame = frame.copy()
 
             # Visualization (in background thread to avoid conflicts)
@@ -316,6 +317,51 @@ class WX200GymEnv(gym.Env):
 
         return obs
 
+    def get_last_frame_copy(self):
+        """Thread-safe access to the latest camera frame."""
+        if not self.has_authority or not self.enable_aruco:
+            return None
+        with self._frame_lock:
+            if self.last_frame is None:
+                return None
+            return self.last_frame.copy()
+
+    def poll_encoders(self, outer_loop_start_time=None):
+        """Refresh encoder cache (outer-loop only)."""
+        if self.robot_hardware and self._hardware_initialized:
+            self.robot_hardware.poll_encoders(outer_loop_start_time=outer_loop_start_time)
+
+    def reset_gripper(self):
+        """Reboot/open the gripper using hardware layer."""
+        if not self._hardware_initialized:
+            try:
+                self._initialize_hardware()
+            except Exception as e:
+                print(f"Hardware init failed: {e}")
+                return False
+        if not self.has_authority:
+            return False
+        self.robot_hardware.reset_gripper()
+        return True
+
+    def home(self):
+        """Move to home pose and sync controller state."""
+        if not self._hardware_initialized:
+            try:
+                self._initialize_hardware()
+            except Exception as e:
+                print(f"Hardware init failed: {e}")
+                return False
+        if not self.has_authority:
+            return False
+        self.robot_hardware.home()
+        return True
+
+    def emergency_stop(self):
+        """Disable torque immediately via hardware layer."""
+        if self.robot_hardware and self._hardware_initialized:
+            self.robot_hardware.emergency_stop()
+
     def _get_observation(self):
         # 1. ArUco
         self.aruco_obs_dict = self._get_aruco_observations()
@@ -375,8 +421,6 @@ class WX200GymEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.episode_step = 0
-        self.last_step_time = None
-        self.prev_aruco_obs_dict = {}
         
         if not self._hardware_initialized:
             try:
@@ -387,48 +431,12 @@ class WX200GymEnv(gym.Env):
         
         if not self.has_authority: return self._get_observation(), {}
         
-        # Reset Gripper Logic (Simplified version of wx200_env_utils)
+        # Reset gripper and move home via hardware layer
         print("[WX200GymEnv] Resetting Gripper...")
-        gripper_id = robot_config.motor_ids[-1]
-        try:
-            self.robot_hardware.robot_driver.reboot_motor(gripper_id)
-            time.sleep(0.5)
-            self.robot_hardware.robot_driver.send_motor_positions({gripper_id: robot_config.gripper_encoder_max})
-            time.sleep(1.0)
-        except Exception as e:
-            print(f"Gripper reset warning: {e}")
-            
-        # Move Home
+        self.robot_hardware.reset_gripper()
+
         print("[WX200GymEnv] Moving Home...")
-        # Get home motor positions using RobotHardware's translator
-        # We can implement a helper in RobotHardware or just do it here loosely since we have access
-        # Better: call a method on RobotHardware if it existed, but we can compute it.
-        # Actually RobotConfig has `startup_home_positions`
-        if robot_config.startup_home_positions:
-             home_pos = {mid: pos for mid, pos in zip(robot_config.motor_ids, robot_config.startup_home_positions)}
-             # Force gripper open in home
-             home_pos[gripper_id] = robot_config.gripper_encoder_max
-             self.robot_hardware.robot_driver.move_to_home(home_pos, velocity_limit=robot_config.velocity_limit)
-        
-        # Sync
-        robot_encoders = self.robot_hardware.robot_driver.read_all_encoders()
-        # We need to sync physics
-        from .robot_kinematics import sync_robot_to_mujoco
-        sync_robot_to_mujoco(robot_encoders, self.robot_hardware.translator,
-                             self.robot_hardware.model, self.robot_hardware.data, self.robot_hardware.configuration)
-        
-        # Reset controller target
-        # RobotHardware.initialize() does this, but we need to do it on reset too
-        # We need access to `actual_position` from sync. sync_robot_to_mujoco returns it.
-        # Let's call it properly.
-        _, act_pos, act_quat = sync_robot_to_mujoco(robot_encoders, self.robot_hardware.translator, 
-                             self.robot_hardware.model, self.robot_hardware.data, self.robot_hardware.configuration)
-                             
-        self.robot_hardware.robot_controller.reset_pose(act_pos, act_quat)
-        self.robot_hardware.robot_controller.end_effector_task.set_target(
-             self.robot_hardware.robot_controller.get_target_pose()
-        )
-        self.robot_hardware.gripper_current_position = robot_config.gripper_open_pos
+        self.robot_hardware.home()
         
         return self._get_observation(), {}
 
@@ -478,10 +486,25 @@ class WX200GymEnv(gym.Env):
             info['raw_aruco'] = self.aruco_obs_dict.copy()
         t_info = time.perf_counter() - t_info_start
 
-        # Store timing info for debugging (only every 50 steps)
-        if self.episode_step % 50 == 0:
-            print(f"    [ENV.STEP] Denorm={t_denorm*1000:.1f}ms, Exec={t_exec*1000:.1f}ms, "
-                  f"Encoder={t_encoder*1000:.1f}ms, Obs={t_obs*1000:.1f}ms, Info={t_info*1000:.1f}ms")
+        # Store timing info for debugging (summary by default, more frequent if verbose)
+        now = time.perf_counter()
+        self._step_timing_samples.append((now, t_denorm, t_exec, t_encoder, t_obs, t_info))
+        window_sec = robot_config.control_perf_window_sec
+        if window_sec and window_sec > 0:
+            cutoff = now - window_sec
+            while self._step_timing_samples and self._step_timing_samples[0][0] < cutoff:
+                self._step_timing_samples.popleft()
+
+        interval = 50 if robot_config.verbose_profiling else robot_config.control_perf_stats_interval
+        if interval and self.episode_step % interval == 0 and self._step_timing_samples:
+            denorm_avg = np.mean([s[1] for s in self._step_timing_samples])
+            exec_avg = np.mean([s[2] for s in self._step_timing_samples])
+            enc_avg = np.mean([s[3] for s in self._step_timing_samples])
+            obs_avg = np.mean([s[4] for s in self._step_timing_samples])
+            info_avg = np.mean([s[5] for s in self._step_timing_samples])
+            print(f"    [ENV.STEP] Avg~{window_sec:.1f}s Denorm={denorm_avg*1000:.1f}ms, "
+                  f"Exec={exec_avg*1000:.1f}ms, Encoder={enc_avg*1000:.1f}ms, "
+                  f"Obs={obs_avg*1000:.1f}ms, Info={info_avg*1000:.1f}ms")
 
         return obs, reward, terminated, truncated, info
 
