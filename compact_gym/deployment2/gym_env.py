@@ -45,8 +45,9 @@ class WX200GymEnv(gym.Env):
     """
     Gym environment for WX200 robot with low-dimensional state observations.
     """
-    # Class-level variable to track which instance has hardware authority
-    _hardware_authority = None
+    """
+    Gym environment for WX200 robot with low-dimensional state observations.
+    """
     
     def __init__(self, max_episode_length=1000, control_frequency=None, 
                  camera_id=None, width=None, height=None, fps=None, 
@@ -58,7 +59,9 @@ class WX200GymEnv(gym.Env):
         self.show_video = show_video
         self.show_axes = show_axes
         
-        self.has_authority = False
+        self.show_video = show_video
+        self.show_axes = show_axes
+        
         self.robot_hardware = None # Instance of RobotHardware
         self._hardware_initialized = False
         
@@ -118,7 +121,7 @@ class WX200GymEnv(gym.Env):
         )
         
         self.episode_step = 0
-
+    
     def _fix_usb_latency(self, device='/dev/ttyUSB0', target_latency=1):
         """Check and fix USB latency for reliable encoder/command timing."""
         import os
@@ -164,15 +167,6 @@ class WX200GymEnv(gym.Env):
         if self._hardware_initialized:
             return
 
-        # Authority Check
-        if WX200GymEnv._hardware_authority is None:
-            WX200GymEnv._hardware_authority = self
-            self.has_authority = True
-        elif WX200GymEnv._hardware_authority == self:
-            self.has_authority = True
-        else:
-            raise RuntimeError("Hardware authority already claimed by another instance.")
-
         try:
             print("[WX200GymEnv] Initializing hardware...")
 
@@ -187,14 +181,11 @@ class WX200GymEnv(gym.Env):
                 
             self._hardware_initialized = True
         except Exception as e:
-            if self.has_authority:
-                WX200GymEnv._hardware_authority = None
-                self.has_authority = False
+            # If init fails, ensure we don't leave partial state
+            self._hardware_initialized = False
             raise e
 
     def _setup_camera(self, camera_id=None, width=None, height=None, fps=None):
-        if not self.has_authority: return
-
         camera_id = camera_id if camera_id is not None else robot_config.camera_id
         width = width if width is not None else robot_config.camera_width
         height = height if height is not None else robot_config.camera_height
@@ -375,7 +366,7 @@ class WX200GymEnv(gym.Env):
         The background thread polls at camera FPS (30 Hz), while this method
         reads the latest observations at control frequency (10 Hz).
         """
-        if not self.has_authority or not self.camera or not self.enable_aruco:
+        if not self._hardware_initialized or not self.camera or not self.enable_aruco:
             return {
                 'aruco_ee_in_world': np.zeros(7),
                 'aruco_object_in_world': np.zeros(7),
@@ -392,7 +383,7 @@ class WX200GymEnv(gym.Env):
 
     def get_last_frame_copy(self):
         """Thread-safe access to the latest camera frame."""
-        if not self.has_authority or not self.enable_aruco:
+        if not self._hardware_initialized or not self.enable_aruco:
             return None
         with self._frame_lock:
             if self.last_frame is None:
@@ -401,7 +392,7 @@ class WX200GymEnv(gym.Env):
 
     def get_latest_aruco_draw_data(self):
         """Thread-safe access to latest ArUco detection data for visualization."""
-        if not self.has_authority or not self.enable_aruco:
+        if not self._hardware_initialized or not self.enable_aruco:
             return None
         with self._aruco_draw_lock:
             data = self._latest_aruco_draw
@@ -434,7 +425,7 @@ class WX200GymEnv(gym.Env):
             except Exception as e:
                 print(f"Hardware init failed: {e}")
                 return False
-        if not self.has_authority:
+        if not self._hardware_initialized:
             return False
         self.robot_hardware.reset_gripper()
         return True
@@ -447,7 +438,7 @@ class WX200GymEnv(gym.Env):
             except Exception as e:
                 print(f"Hardware init failed: {e}")
                 return False
-        if not self.has_authority:
+        if not self._hardware_initialized:
             return False
         self.robot_hardware.home()
         return True
@@ -462,9 +453,8 @@ class WX200GymEnv(gym.Env):
         self.aruco_obs_dict = self._get_aruco_observations()
 
         # 2. Robot State & EE Pose
-        if not self.has_authority or not self._hardware_initialized:
-            robot_state = np.zeros(6)
-            ee_pose_debug = np.zeros(7)
+        if not self._hardware_initialized:
+            return self.observation_space.sample() # Return zeros if no hardware
         else:
             # Try to use encoder state if available (more accurate than commanded state)
             encoder_state = self.robot_hardware.get_encoder_state()
@@ -524,7 +514,7 @@ class WX200GymEnv(gym.Env):
                 print(f"Hardware init failed: {e}")
                 return self._get_observation(), {}
         
-        if not self.has_authority: return self._get_observation(), {}
+        if not self._hardware_initialized: return self._get_observation(), {}
         
         # Reset gripper and move home via hardware layer
         print("[WX200GymEnv] Resetting Gripper...")
@@ -547,7 +537,7 @@ class WX200GymEnv(gym.Env):
 
         # Execute
         t_exec_start = time.perf_counter()
-        if self.has_authority and self._hardware_initialized:
+        if self._hardware_initialized:
             self.robot_hardware.execute_command(vel, ang_vel, grip, self.dt)
         t_exec = time.perf_counter() - t_exec_start
 
@@ -571,7 +561,7 @@ class WX200GymEnv(gym.Env):
         # Build info dict with encoder data and raw ArUco observations
         t_info_start = time.perf_counter()
         info = {}
-        if self.has_authority and self._hardware_initialized:
+        if self._hardware_initialized:
             encoder_state = self.robot_hardware.get_encoder_state()
             info['encoder_values'] = encoder_state['encoder_values']
             info['qpos'] = encoder_state['joint_angles']
@@ -604,26 +594,26 @@ class WX200GymEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def close(self):
-        """Clean up resources including background thread."""
-        # Stop ArUco polling thread
+        """Clean up hardware resources."""
+        # Stop ArUco polling thread first
         self._aruco_polling_active = False
-        if self._aruco_poll_thread is not None:
+        if self._aruco_poll_thread and self._aruco_poll_thread.is_alive():
             self._aruco_poll_thread.join(timeout=1.0)
-
-        # Close camera
-        if self.camera:
-            if hasattr(self.camera, 'release'):
-                self.camera.release()
-            elif hasattr(self.camera, 'stop'):
-                self.camera.stop()
-
-        # Clean up hardware
-        if self.robot_hardware:
-            self.robot_hardware.shutdown()
-
-        # Release hardware authority
-        if self.has_authority:
-            WX200GymEnv._hardware_authority = None
-            self.has_authority = False
-
+            
+        if self._hardware_initialized:
+            print("[WX200GymEnv] Closing hardware...")
+            if self.enable_aruco and self.camera:
+                if hasattr(self.camera, 'stop'):
+                    self.camera.stop()
+                elif hasattr(self.camera, 'release'):
+                    self.camera.release()
+                elif hasattr(self.camera, 'close'):
+                    self.camera.close()
+            
+            if self.robot_hardware:
+                self.robot_hardware.shutdown()
+                
+            self._hardware_initialized = False
+            
+        super().close()
         cv2.destroyAllWindows()

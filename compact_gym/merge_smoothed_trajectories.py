@@ -200,7 +200,7 @@ def main():
         type=Path,
         nargs="?",
         default=None,
-        help="Directory containing smoothed trajectory files (default: data/unsmoothed_data)",
+        help="Directory containing demo/trajectory files (default: data/gym_demos)",
     )
     parser.add_argument(
         "-o", "--output",
@@ -217,7 +217,7 @@ def main():
     args = parser.parse_args()
     
     if args.input_dir is None:
-        args.input_dir = Path(__file__).parent / "data" / "unsmoothed_data"
+        args.input_dir = Path(__file__).parent / "data" / "gym_demos"
     
     if not args.input_dir.exists():
         print(f"Error: Directory not found: {args.input_dir}")

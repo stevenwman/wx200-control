@@ -1,6 +1,5 @@
 legacy_code/**
 compact_code/**
-compact_gym/data/**
 compact_gym/trajectory_viewer_gui.py
 examples/**
 
