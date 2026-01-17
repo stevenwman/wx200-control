@@ -56,6 +56,7 @@ class RobotConfig:
     # SpaceMouse deadzones (prevents drift from noise)
     velocity_deadzone: float = 0.001  # Linear velocity deadzone (m/s)
     angular_velocity_deadzone: float = 0.01  # Angular velocity deadzone (rad/s)
+    spacemouse_stale_timeout: float = 0.2  # Seconds before clearing stale button states
 
     control_frequency: float = 10.0  # Outer loop frequency (Hz) - teleop/policy/observations
     inner_control_frequency: float = 120.0  # Inner loop frequency (Hz) - IK solving and motor commands

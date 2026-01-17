@@ -78,12 +78,26 @@ class WX200GymEnv(gym.Env):
         self._aruco_poll_thread = None
         self._aruco_lock = threading.Lock()  # Protects latest_aruco_obs updates
         self._frame_lock = threading.Lock()  # Protects last_frame updates
+        self._aruco_draw_lock = threading.Lock()  # Protects latest draw data
         self.latest_aruco_obs = {
             'aruco_ee_in_world': np.zeros(7),
             'aruco_object_in_world': np.zeros(7),
             'aruco_ee_in_object': np.zeros(7),
             'aruco_object_in_ee': np.zeros(7),
             'aruco_visibility': np.zeros(3)
+        }
+        self._latest_aruco_draw = {
+            'corners': None,
+            'ids': None,
+            'world_visible': False,
+            'object_visible': False,
+            'ee_visible': False,
+            'r_world': None,
+            't_world': None,
+            'r_obj': None,
+            't_obj': None,
+            'r_ee': None,
+            't_ee': None,
         }
 
         self.profiler = ArUcoProfiler() if robot_config.profiler_window_size > 0 else None
@@ -251,6 +265,21 @@ class WX200GymEnv(gym.Env):
             # Store latest frame for rendering (separate lock to reduce contention)
             with self._frame_lock:
                 self.last_frame = frame.copy()
+            # Store latest detection data for overlay rendering
+            with self._aruco_draw_lock:
+                self._latest_aruco_draw = {
+                    'corners': [c.copy() for c in corners] if corners is not None else None,
+                    'ids': ids.copy() if ids is not None else None,
+                    'world_visible': world_visible,
+                    'object_visible': object_visible,
+                    'ee_visible': ee_visible,
+                    'r_world': r_world.copy() if r_world is not None else None,
+                    't_world': t_world.copy() if t_world is not None else None,
+                    'r_obj': r_obj.copy() if r_obj is not None else None,
+                    't_obj': t_obj.copy() if t_obj is not None else None,
+                    'r_ee': r_ee.copy() if r_ee is not None else None,
+                    't_ee': t_ee.copy() if t_ee is not None else None,
+                }
 
             # Visualization (in background thread to avoid conflicts)
             if self.show_video:
@@ -325,6 +354,28 @@ class WX200GymEnv(gym.Env):
             if self.last_frame is None:
                 return None
             return self.last_frame.copy()
+
+    def get_latest_aruco_draw_data(self):
+        """Thread-safe access to latest ArUco detection data for visualization."""
+        if not self.has_authority or not self.enable_aruco:
+            return None
+        with self._aruco_draw_lock:
+            data = self._latest_aruco_draw
+            if data is None:
+                return None
+            return {
+                'corners': [c.copy() for c in data['corners']] if data['corners'] is not None else None,
+                'ids': data['ids'].copy() if data['ids'] is not None else None,
+                'world_visible': data['world_visible'],
+                'object_visible': data['object_visible'],
+                'ee_visible': data['ee_visible'],
+                'r_world': data['r_world'].copy() if data['r_world'] is not None else None,
+                't_world': data['t_world'].copy() if data['t_world'] is not None else None,
+                'r_obj': data['r_obj'].copy() if data['r_obj'] is not None else None,
+                't_obj': data['t_obj'].copy() if data['t_obj'] is not None else None,
+                'r_ee': data['r_ee'].copy() if data['r_ee'] is not None else None,
+                't_ee': data['t_ee'].copy() if data['t_ee'] is not None else None,
+            }
 
     def poll_encoders(self, outer_loop_start_time=None):
         """Refresh encoder cache (outer-loop only)."""

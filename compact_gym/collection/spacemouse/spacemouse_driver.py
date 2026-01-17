@@ -11,6 +11,7 @@ Maintains:
 """
 import multiprocessing as mp
 import queue
+import time
 import numpy as np
 from .spacemouse_reader import spacemouse_process
 
@@ -50,6 +51,8 @@ class SpaceMouseDriver:
         from deployment.robot_config import robot_config
         self.velocity_deadzone = robot_config.velocity_deadzone
         self.angular_velocity_deadzone = robot_config.angular_velocity_deadzone
+        self.stale_timeout = robot_config.spacemouse_stale_timeout
+        self.last_update_time = None
     
     def start(self):
         """Start the SpaceMouse reader process."""
@@ -96,6 +99,11 @@ class SpaceMouseDriver:
                 break
         
         if latest_command is None:
+            # Clear stale button states if we haven't seen input in a while
+            if self.last_update_time is not None:
+                if time.time() - self.last_update_time > self.stale_timeout:
+                    self.left_button_prev = False
+                    self.right_button_prev = False
             return False
         
         # Extract translation as velocity in world frame
@@ -118,6 +126,7 @@ class SpaceMouseDriver:
         button_state = latest_command.get('button', [])
         self.left_button_prev = len(button_state) > 0 and button_state[0] == 1
         self.right_button_prev = len(button_state) > 1 and button_state[1] == 1
+        self.last_update_time = latest_command.get('timestamp', time.time())
         
         return True
     
@@ -149,6 +158,19 @@ class SpaceMouseDriver:
                 - right_button_pressed: True if right button is currently held
         """
         return (self.left_button_prev, self.right_button_prev)
+
+    def reset_state(self):
+        """Clear queued input and reset button state."""
+        while not self.data_queue.empty():
+            try:
+                self.data_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.velocity_world.fill(0.0)
+        self.angular_velocity_world.fill(0.0)
+        self.left_button_prev = False
+        self.right_button_prev = False
+        self.last_update_time = None
     
     def get_gripper_command(self, current_gripper_position, dt):
         """

@@ -61,6 +61,10 @@ class DemoCollector:
         self.profiler = LightweightProfiler()
         self._breakdown_history = []
         self._viz_frame_times = []
+        self._viz_last_duration = 0.0
+        self._viz_next_time = None
+        self._viz_dt = None
+        self._viz_axis_length = robot_config.aruco_marker_size_m * robot_config.aruco_axis_length_scale
         
         # Init SpaceMouse
         self.spacemouse = SpaceMouseDriver(
@@ -126,6 +130,8 @@ class DemoCollector:
             print("Moving Home...")
             try:
                 self.env.home()
+                self.current_gripper_pos = robot_config.gripper_open_pos
+                self.spacemouse.reset_state()
             except Exception as e:
                 print(f"Error Homing: {e}")
 
@@ -134,6 +140,7 @@ class DemoCollector:
             try:
                 self.env.reset_gripper()
                 self.current_gripper_pos = robot_config.gripper_open_pos
+                self.spacemouse.reset_state()
             except Exception as e:
                 print(f"Error Resetting Gripper: {e}")
 
@@ -228,6 +235,38 @@ class DemoCollector:
         }
         self.trajectory.append(step_data)
 
+    def _render_visualization(self, frame):
+        """Render ArUco overlay and recording status onto the frame."""
+        # Draw ArUco overlay
+        draw_data = self.env.get_latest_aruco_draw_data()
+        if draw_data and draw_data['corners'] is not None and draw_data['ids'] is not None:
+            cv2.aruco.drawDetectedMarkers(frame, draw_data['corners'], draw_data['ids'])
+            if self.env.cam_matrix is not None and self.env.dist_coeffs is not None:
+                if draw_data['world_visible'] and draw_data['r_world'] is not None:
+                    cv2.drawFrameAxes(
+                        frame, self.env.cam_matrix, self.env.dist_coeffs,
+                        draw_data['r_world'], draw_data['t_world'], self._viz_axis_length
+                    )
+                if draw_data['object_visible'] and draw_data['r_obj'] is not None:
+                    cv2.drawFrameAxes(
+                        frame, self.env.cam_matrix, self.env.dist_coeffs,
+                        draw_data['r_obj'], draw_data['t_obj'], self._viz_axis_length
+                    )
+                if draw_data['ee_visible'] and draw_data['r_ee'] is not None:
+                    cv2.drawFrameAxes(
+                        frame, self.env.cam_matrix, self.env.dist_coeffs,
+                        draw_data['r_ee'], draw_data['t_ee'], self._viz_axis_length
+                    )
+
+        # Draw Recording Status
+        color = (0, 0, 255) if self.is_recording else (0, 255, 0)
+        text = "RECORDING" if self.is_recording else "READY"
+        cv2.putText(frame, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+
+        # Show
+        cv2.imshow("Data Collector", cv2.resize(frame, (960, 540)))
+        cv2.waitKey(1)
+
     def start_recording(self):
         if not self.is_recording:
             self.is_recording = True
@@ -301,13 +340,19 @@ class DemoCollector:
         # - Inner loop at 120Hz: motor commands (env.step)
         # - Outer loop at 10Hz: SpaceMouse input, encoder polling, recording
         inner_rate_limiter = RateLimiter(frequency=robot_config.inner_control_frequency, warn=False)
+        self._viz_dt = 1.0 / robot_config.camera_fps if robot_config.camera_fps > 0 else None
+        self._viz_next_time = time.perf_counter() + (self._viz_dt or 0.0)
 
         # Outer loop timing
         outer_loop_dt = 1.0 / robot_config.control_frequency  # 0.1s for 10Hz
         outer_loop_target_time = time.perf_counter() + outer_loop_dt
 
         # Cache for latest action (reused across inner loop iterations)
+        # Initialize gripper to "open" to avoid a brief mid-grip command before first outer loop tick.
+        gripper_range = robot_config.gripper_closed_pos - robot_config.gripper_open_pos
+        norm_gripper_init = 2.0 * (self.current_gripper_pos - robot_config.gripper_open_pos) / gripper_range - 1.0
         latest_action = np.zeros(7)  # [vel(3), ang_vel(3), gripper(1)]
+        latest_action[6] = np.clip(norm_gripper_init, -1.0, 1.0)
 
         # Timing breakdown storage for outer loop profiling
         t_input = 0.0
@@ -360,6 +405,25 @@ class DemoCollector:
                 _, _, _, _, info = self.env.step(latest_action)
                 t_step = time.perf_counter() - t_step_start
 
+                # === VISUALIZATION (camera rate) ===
+                if self._viz_dt:
+                    now = time.perf_counter()
+                    if now >= self._viz_next_time:
+                        self._viz_next_time = now + self._viz_dt
+                        t_viz_start = time.perf_counter()
+                        frame = self.env.get_last_frame_copy()
+                        if frame is not None:
+                            self._render_visualization(frame)
+
+                            # Track visualization update timestamps
+                            self._viz_last_duration = time.perf_counter() - t_viz_start
+                            self._viz_frame_times.append(now)
+                            window_sec = robot_config.control_perf_window_sec
+                            if window_sec and window_sec > 0:
+                                cutoff = now - window_sec
+                                while self._viz_frame_times and self._viz_frame_times[0] < cutoff:
+                                    self._viz_frame_times.pop(0)
+
                 # === OUTER LOOP CONTINUED (10Hz) ===
                 # Record data, visualization, and profiling only in outer loop
                 if time_based_trigger:
@@ -370,30 +434,7 @@ class DemoCollector:
                     if self.is_recording:
                         self._record_step(info, vel_world, ang_vel_world, latest_action, frame, dt_outer)
                     t_record = time.perf_counter() - t_record_start
-
-                    # 5. Visualization overlay
-                    t_viz_start = time.perf_counter()
-                    if frame is not None:
-                        # Use latest frame captured by env (thread-safe copy)
-                        frame = frame.copy()
-
-                        # Draw Recording Status
-                        color = (0, 0, 255) if self.is_recording else (0, 255, 0)
-                        text = "RECORDING" if self.is_recording else "READY"
-                        cv2.putText(frame, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-
-                        # Show
-                        cv2.imshow("Data Collector", cv2.resize(frame, (960, 540)))
-                        cv2.waitKey(1)
-                        # Track visualization update timestamps
-                        now = time.perf_counter()
-                        self._viz_frame_times.append(now)
-                        window_sec = robot_config.control_perf_window_sec
-                        if window_sec and window_sec > 0:
-                            cutoff = now - window_sec
-                            while self._viz_frame_times and self._viz_frame_times[0] < cutoff:
-                                self._viz_frame_times.pop(0)
-                    t_viz = time.perf_counter() - t_viz_start
+                    t_viz = self._viz_last_duration
 
                     # Record breakdown stats for rolling averages
                     now = time.perf_counter()

@@ -1,0 +1,26 @@
+# --- Data Files (The biggest culprit) ---
+# You uploaded a CSV earlier. If you have a folder full of these,
+# the AI reads them every time.
+*.csv
+*.json
+*.log
+*.txt
+*.xml
+
+# --- Python Junk ---
+__pycache__/
+*.pyc
+venv/
+.env
+
+# --- Lock Files ---
+# These are massive lists of versions. The AI rarely needs them.
+package-lock.json
+yarn.lock
+poetry.lock
+
+# --- Assets & Media ---
+*.png
+*.jpg
+*.svg
+*.pdf
