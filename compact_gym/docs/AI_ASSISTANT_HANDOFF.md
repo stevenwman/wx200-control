@@ -1,7 +1,7 @@
 # AI Assistant Handoff Document
 
 **Last Updated**: 2026-01-16
-**Status**: ✅ Production Ready - Recent reorganization complete
+**Status**: ✅ Production Ready (reorg complete; see Known Issues)
 
 ---
 
@@ -124,7 +124,7 @@ During reorganization, we found and fixed these import errors:
 
 1. **collection/spacemouse/__init__.py** - Was using `from spacemouse.spacemouse_driver` instead of `from .spacemouse_driver`
 2. **collection/spacemouse/spacemouse_driver.py** - Was using `from spacemouse.spacemouse_reader` instead of `from .spacemouse_reader`
-3. **deployment/gym_env.py:416** - Had `from robot_kinematics import sync_robot_to_mujoco` instead of `from .robot_kinematics import`
+3. **deployment/gym_env.py** - Had `from robot_kinematics import ...` instead of `from .robot_kinematics import ...`
 4. **scripts/verify_encoder_implementation.py** - Used `from compact_gym.robot_hardware` instead of `from deployment.robot_hardware`
 5. **scripts/test_encoder_polling.py** - Used `from compact_gym import WX200GymEnv` instead of proper package imports
 
@@ -132,7 +132,7 @@ During reorganization, we found and fixed these import errors:
 
 Each package has an `__init__.py`:
 
-**deployment/__init__.py** - Uses **lazy loading** to avoid dependency errors:
+**deployment/__init__.py** - Package marker; keep it import-light (no eager imports):
 ```python
 """
 Deployment package for WX200 gym environment.
@@ -205,34 +205,35 @@ Just provide normalized actions `[-1, 1]^7` and the environment handles the rest
 
 ### Dual-Frequency Architecture
 
-**Critical performance feature**:
+**Critical performance feature** (implemented in `collect_demo_gym.py`):
 
-- **Inner loop (120Hz)**: Motor commands, IK solving, physics stepping
-- **Outer loop (10Hz)**: Encoder polling, ArUco detection, data recording, user input
+- **Inner loop (~120Hz)**: `env.step()` with cached action (IK + motor commands)
+- **Outer loop (~10Hz)**: SpaceMouse input, GUI commands, encoder polling, recording
+- **ArUco thread (~camera_fps)**: Camera + marker detection in background
 
-This prevents jitter while maintaining accurate data collection.
+This prevents jitter while keeping data collection lightweight.
 
-**Implementation details**:
-- `env.step()` uses `dt = 1/120` for physics
-- Data collection calls `env.step()` in a loop at 10Hz
-- Each outer loop cycle runs 12 inner loop steps
-- See [docs/RUNTIME_FIXES.md](RUNTIME_FIXES.md) Issue #6 for full explanation
+**Implementation notes**:
+- `WX200GymEnv` is single-step; it does **not** run the inner loop for you.
+- Teleop uses `loop_rate_limiters.RateLimiter` to hold ~120Hz.
+- Encoder polling happens via `env.poll_encoders()` in the outer loop.
+- `env.step()` uses `dt = 1 / control_frequency` from its constructor (pass `inner_control_frequency` for 120Hz stepping).
 
 ### Data Flow
 
 **During teleoperation**:
 1. SpaceMouse raw input → normalized action `[-1, 1]^7`
-2. `env.step(action)` → denormalizes to velocity commands
-3. IK solver → computes joint velocities
-4. Motor commands → sent at 120Hz
-5. Encoders read → synced to MuJoCo at 10Hz
-6. Observations → ArUco poses, joint states, images
-7. Recording → saves to NPZ at 10Hz
+2. `env.step(action)` → denormalizes to linear/angular velocities + gripper position
+3. IK solver → joint commands → motor positions at inner-loop rate
+4. `env.poll_encoders()` (outer loop) → refresh encoder cache for observations
+5. ArUco thread → updates `aruco_*` + `last_frame` at `camera_fps`
+6. Recording (outer loop) → saves NPZ at `control_frequency` (then smoothing adds `smoothed_*` keys in-place)
 
 **During NN deployment**:
 1. Policy network → normalized action `[-1, 1]^7`
-2. `env.step(action)` → (same as above)
-3. No recording infrastructure needed
+2. `env.step(action)` → same denormalization + control path
+3. You must call `env.step()` at your desired control rate (set `control_frequency` accordingly)
+4. No recording infrastructure needed
 
 ---
 
@@ -250,7 +251,7 @@ action = [
     omega_x,    # Angular velocity around world X (roll)
     omega_y,    # Angular velocity around world Y (pitch)
     omega_z,    # Angular velocity around world Z (yaw)
-    gripper     # Gripper: -1 = open, +1 = close
+    gripper     # Gripper position (normalized): -1=open, +1=closed
 ]
 ```
 
@@ -261,26 +262,25 @@ action = [
 Happens in `deployment/gym_env.py`:
 
 ```python
-# Translation: [-1, 1] → [-max_lin_vel, +max_lin_vel] m/s
-ee_command[:3] = action[:3] * robot_config.max_ee_linear_velocity
+# Translation: [-1, 1] → [-velocity_scale, +velocity_scale] m/s
+vel = action[:3] * robot_config.velocity_scale
 
-# Rotation: [-1, 1] → [-max_ang_vel, +max_ang_vel] rad/s
-ee_command[3:6] = action[3:6] * robot_config.max_ee_angular_velocity
+# Rotation: [-1, 1] → [-angular_velocity_scale, +angular_velocity_scale] rad/s
+ang = action[3:6] * robot_config.angular_velocity_scale
 
-# Gripper: [-1, 1] → stay as is
-ee_command[6] = action[6]
+# Gripper: [-1, 1] → [gripper_open_pos, gripper_closed_pos] (meters)
+grip = (action[6] + 1.0) / 2.0 * (robot_config.gripper_closed_pos - robot_config.gripper_open_pos) + robot_config.gripper_open_pos
 ```
 
-**GOTCHA**: The gripper action is **NOT** denormalized. It stays in `[-1, 1]` and is interpreted as:
-- `action[6] < 0` → open gripper
-- `action[6] > 0` → close gripper
-- Magnitude controls speed
+**GOTCHA**: The gripper action is interpreted as a **position command** (normalized).  
+`-1` → open, `+1` → closed; intermediate values are valid positions.
 
 ### Common Mistakes
 
 ❌ **Don't** pass velocity commands directly to `env.step()` - they must be normalized first
 ❌ **Don't** confuse world frame with end-effector frame
 ❌ **Don't** denormalize actions in the teleop layer - that's the env's job
+❌ **Don't** pass gripper position in meters to `env.step()` (it expects normalized)
 ✅ **Do** keep all actions in `[-1, 1]` when calling `env.step()`
 ✅ **Do** let the environment handle all denormalization internally
 
@@ -290,115 +290,95 @@ See [docs/overview/ACTION_SPACE_NOTES.md](overview/ACTION_SPACE_NOTES.md) for mo
 
 ## Key Files and Their Roles
 
-### Deployment Package Files
+### Deployment Package Files (self-contained for NN use)
 
-**deployment/gym_env.py** (658 lines)
-- Main gymnasium environment interface
-- Implements `reset()`, `step()`, `close()`
-- Handles action denormalization
-- Manages ArUco background thread
-- Controls dual-frequency architecture
-- **Key classes**: `WX200GymEnv`
+**deployment/gym_env.py**
+- Gymnasium environment (`WX200GymEnv`)
+- Action denormalization + observation assembly
+- ArUco background thread + frame storage
+- Exposes `poll_encoders()`, `home()`, `reset_gripper()`, `emergency_stop()`
 
-**deployment/robot_hardware.py** (388 lines)
-- Hardware abstraction layer
-- Manages RobotDriver, RobotController, JointToMotorTranslator
-- Encoder polling at 10Hz (outer loop only)
-- MuJoCo physics sync
-- **Key classes**: `RobotHardware`
+**deployment/robot_hardware.py**
+- Hardware abstraction + MuJoCo state sync
+- Encoder polling and cached encoder/EE pose state
+- Startup/home/reset/shutdown sequences
 
-**deployment/robot_kinematics.py** (486 lines)
-- IK/FK solver using MuJoCo
-- Joint to motor translations
+**deployment/robot_kinematics.py**
+- IK/FK + joint↔motor translation
 - Gripper position control
-- Robot-to-MuJoCo state syncing
-- **Key classes**: `RobotController`, `JointToMotorTranslator`
 
-**deployment/robot_driver.py** (289 lines)
-- Low-level motor control via Dynamixel SDK
-- Direct serial communication to robot
-- Motor position/velocity commands
-- Encoder reading
-- **Key classes**: `RobotDriver`
+**deployment/robot_driver.py**
+- Dynamixel SDK driver (serial comms, motor commands)
 
-**deployment/robot_config.py** (135 lines)
-- Single source of truth for all configuration
-- Hardware limits, control frequencies, camera settings
-- **Key object**: `robot_config` (singleton)
+**deployment/robot_config.py**
+- Single source of truth for configuration (`robot_config`)
 
-**deployment/camera.py** (398 lines)
-- Camera interface (USB or RealSense)
-- ArUco marker detection and pose estimation
-- GStreamer environment fix for OpenCV
-- **Key classes**: `Camera`, `ArUcoPoseEstimator`
+**deployment/camera.py**
+- GStreamer-only camera capture
+- ArUco pose estimation (with optional pose hold)
 
-**deployment/profiling.py** (205 lines)
-- Lightweight profiling for performance monitoring
-- ArUco detection statistics
-- **Key classes**: `LightweightProfiler`, `ArUcoProfiler`
+**deployment/fix_gstreamer_env.py**
+- Ensures GStreamer environment is configured before `cv2` import
+
+**deployment/profiling.py**
+- Lightweight control loop + ArUco profiling
 
 **deployment/wx200/** (directory)
-- MuJoCo XML model files
-- Scene configurations
-- Robot URDF/MJCF definitions
+- MuJoCo XML + mesh assets
 
 ### Collection Infrastructure Files
 
-**collection/validate_demo.py** (289 lines)
-- Validates recorded demonstration files
-- Checks for required fields, correct shapes, no NaNs
-- Verifies recording frequency (~10Hz)
-- Can validate single demo or all demos
-- Usage: `python collection/validate_demo.py [--file demo.npz] [--all]`
+**collect_demo_gym.py** (root)
+- Teleop + data recording loop (inner/outer rate)
+- GUI + SpaceMouse integration
+- Saves NPZ + optional in-place smoothing
+- GUI commands: Home, Reset EE, Start Recording, Stop & Save, Stop & Discard
 
-**collection/fix_usb_latency.py** (60 lines)
-- Fixes USB latency from 16ms → 1ms for smooth control
-- Auto-runs on startup in `collect_demo_gym.py`
-- Requires sudo access
-- **Critical for smooth teleoperation**
+**collection/validate_demo.py**
+- Validates demo NPZ schema + basic quality checks
+- `action_normalized` and `metadata` are optional
 
-**collection/spacemouse/spacemouse_driver.py** (222 lines)
-- High-level SpaceMouse interface
-- Handles button presses, axis scaling
-- Multiprocessing architecture for low-latency reading
-- **Key classes**: `SpaceMouseDriver`
+**collection/fix_usb_latency.py**
+- Sets USB latency timer to 1ms (auto-run on startup)
 
-**collection/spacemouse/spacemouse_reader.py** (88 lines)
-- Low-level SpaceMouse HID reading
-- Runs in separate process for isolation
-- **Key functions**: `spacemouse_process`
+**collection/spacemouse/**
+- `spacemouse_driver.py`: high-level SpaceMouse interface (stale-state reset)
+- `spacemouse_reader.py`: multiprocessing reader (pyspacemouse)
 
-**collection/utils/robot_control_gui.py** (128 lines)
-- Simple Tkinter GUI for status display
-- Shows recording state, profiling info
-- Runs in separate thread
+**collection/utils/robot_control_gui.py**
+- Tkinter GUI with buttons + status
 
-### Main Scripts
+### Scripts (dev/test utilities)
 
-**collect_demo_gym.py** (437 lines)
-- Main data collection script
-- SpaceMouse teleoperation loop
-- Recording state machine (ready/recording/paused)
-- Saves demos as NPZ files
-- Usage: `python collect_demo_gym.py`
-- **GUI controls**:
-  - Start Recording - begin new demo
-  - Stop & Save - save demo
-  - Stop & Discard - discard demo
-  - Home - move to home pose
-  - Reset EE - reboot/open gripper
-  - Close GUI window - quit
+**scripts/test_env.py**
+- Random-policy smoke test
 
-**scripts/verify_teleop_gym.py** (156 lines)
-- Tests teleoperation without recording
-- 30-second SpaceMouse control test
-- Verifies action normalization
-- Usage: `python scripts/verify_teleop_gym.py`
+**scripts/verify_teleop_gym.py**
+- Manual teleop (runs until Ctrl+C)
 
-**scripts/test_env.py** (52 lines)
-- Random policy test
-- Verifies environment loads correctly
-- Usage: `python scripts/test_env.py`
+**scripts/test_encoder_polling.py**
+- Hardware encoder polling performance test
+
+**scripts/verify_encoder_syntax.py**
+- AST-only structure/syntax check (no hardware)
+
+**scripts/verify_encoder_implementation.py**
+- Import-level check for encoder polling API
+
+**scripts/verify_aruco_thread_syntax.py**
+- AST check for ArUco thread wiring
+
+**scripts/smooth_aruco_trajectory.py**
+- Smooth ArUco trajectories (atomic save; supports in-place)
+
+**scripts/verify_smoothed_trajectory.py**
+- Verify smoothed file matches original (except `smoothed_*` keys)
+
+### Dataset Utilities
+
+**merge_smoothed_trajectories.py** (root)
+- Merge demo/trajectory NPZ files into a training dataset
+- Uses `smoothed_aruco_*` keys when available
 
 ---
 
@@ -409,45 +389,49 @@ Demonstrations are saved as NumPy NPZ files in `data/gym_demos/`:
 ```python
 {
     # Timestamps
-    'timestamp': float[T],              # Wall clock timestamps (seconds)
+    'timestamp': float[T],              # Wall clock timestamps (time.time(), seconds)
 
     # Robot state
     'state': float[T, 6],              # Joint angles from encoders
     'encoder_values': int[T, 7],       # Raw encoder values
     'ee_pose_encoder': float[T, 7],    # EE pose from FK [x,y,z, qw,qx,qy,qz]
 
-    # Actions (denormalized velocity commands)
-    'action': float[T, 7],             # [v_x, v_y, v_z, ω_x, ω_y, ω_z, gripper]
+    # Actions (denormalized velocity + gripper position)
+    'action': float[T, 7],             # [v_x, v_y, v_z, ω_x, ω_y, ω_z, gripper_pos_m]
     'action_normalized': float[T, 7],  # Normalized action in [-1, 1]
 
     # Augmented actions (with axis-angle integration)
-    'augmented_actions': float[T, 10], # Actions + integrated orientation
+    'augmented_actions': float[T, 10], # vel(3) + ang(3) + axis_angle(3) + gripper_pos(1)
 
     # IK targets
     'ee_pose_target': float[T, 7],     # Target pose sent to IK solver
 
     # ArUco markers (if enabled)
-    'object_pose': float[T, 7],        # Object pose in world (if visible)
+    'object_pose': float[T, 7],        # Object pose in world (alias of aruco_object_in_world)
     'object_visible': float[T, 1],     # Object visibility flag
     'aruco_ee_in_world': float[T, 7],
     'aruco_object_in_world': float[T, 7],
     'aruco_ee_in_object': float[T, 7],
     'aruco_object_in_ee': float[T, 7],
-    'aruco_visibility': float[T, 3],
+    'aruco_visibility': float[T, 3],   # Order: [world, object, ee]
 
     # Camera (if enabled)
-    'camera_frame': uint8[T, 270, 480, 3]  # RGB frames (downscaled from 1920x1080)
+    'camera_frame': uint8[T, H, W, 3]  # RGB frames (downscaled by frame_downscale_factor)
 
-    # Smoothing (added in-place after save)
+    # Smoothing (added in-place by collector; script can also write _smoothed files)
     'smoothed_aruco_*': float[T, 7],
 
     # Metadata
-    'metadata': dict,                  # created_at, file_name, config_snapshot
+    'metadata': dict,                  # created_at, file_name, config_snapshot (+ smoothing_note)
 }
 ```
 
+Note: `camera_frame` is always saved; if no frame is available it is a zero array.  
+`metadata` is stored as a pickled dict — load with `np.load(..., allow_pickle=True)`.
+
 **Key validation criteria** (from `collection/validate_demo.py`):
 - ✅ All expected fields present
+- ⚠ Optional fields (warn-only): `action_normalized`, `metadata`
 - ✅ Trajectory length > 1 step
 - ✅ Recording frequency ~10 Hz (±20% tolerance)
 - ✅ `ee_pose_target` is not all zeros (IK target being tracked)
@@ -464,30 +448,39 @@ All configuration is centralized in `deployment/robot_config.py`:
 @dataclass
 class RobotConfig:
     # Control frequencies
-    control_frequency: int = 10          # Outer loop (data collection)
-    inner_control_frequency: int = 120   # Inner loop (motor commands)
+    control_frequency: float = 10.0        # Outer loop (teleop/policy/recording)
+    inner_control_frequency: float = 120.0 # Inner loop (motor commands)
 
-    # Velocity limits (in m/s and rad/s)
-    max_ee_linear_velocity: float = 0.15   # Max translation speed
-    max_ee_angular_velocity: float = 1.0   # Max rotation speed
-    velocity_limit: float = 0.5            # Motor velocity limit
+    # Action scaling (m/s and rad/s)
+    velocity_scale: float = 0.25
+    angular_velocity_scale: float = 1.0
+    velocity_limit: int = 40               # Motor velocity limit (Dynamixel)
 
     # Gripper limits
-    gripper_encoder_min: int = 1250
-    gripper_encoder_max: int = 2550
+    gripper_open_pos: float = -0.026
+    gripper_closed_pos: float = 0.0
+    gripper_encoder_min: int = 1559
+    gripper_encoder_max: int = 2776
 
-    # Camera
-    camera_id: int = 1                   # USB camera device ID
+    # Camera (GStreamer only)
+    camera_id: int = 1                     # Maps to /dev/video{camera_id}
     camera_width: int = 1920
     camera_height: int = 1080
     camera_fps: int = 30
-    aruco_dict: int = cv2.aruco.DICT_4X4_50
+    frame_downscale_factor: int = 4
 
-    # ArUco thread
-    aruco_polling_rate: int = 30         # Hz
+    # ArUco
+    aruco_marker_size_m: float = 0.030
+    aruco_world_id: int = 0
+    aruco_object_id: int = 2
+    aruco_ee_id: int = 3
+    aruco_max_preserve_frames: int = 0
 
-    # Profiling
-    profiler_window_size: int = 100      # Samples for rolling average
+    # Profiling + input
+    control_perf_window_sec: float = 3.0
+    control_perf_stats_interval: int = 500
+    profiler_window_size: int = 200
+    spacemouse_stale_timeout: float = 0.2
 ```
 
 **To modify behavior**: Edit values in `robot_config.py`, don't hardcode magic numbers elsewhere.
@@ -509,16 +502,15 @@ python collection/fix_usb_latency.py
 
 **Reference**: [docs/RUNTIME_FIXES.md](RUNTIME_FIXES.md) Issue #1
 
-### 2. Robot Moving 12x Too Fast
+### 2. Control-Frequency Mismatch (Robot too fast/slow)
 
-**Problem**: If robot moves way too fast, `env.step()` is using wrong dt.
+**Problem**: Robot moves much too fast or sluggish.
 
-**Root cause**: Using `control_frequency` (10Hz) instead of `inner_control_frequency` (120Hz) for physics stepping.
+**Root cause**: `WX200GymEnv` uses `dt = 1 / control_frequency` from its constructor.  
+If you call `env.step()` at 10Hz but pass `control_frequency=120`, the motion will be ~12× too fast (and vice versa).
 
-**Fix**: Verify `gym_env.py` uses:
-```python
-self.dt = 1.0 / robot_config.inner_control_frequency  # Should be 1/120 = 0.00833s
-```
+**Fix**: Set `control_frequency` to the actual rate you call `env.step()`.  
+In teleop, `collect_demo_gym.py` calls `env.step()` at ~120Hz and passes `inner_control_frequency`.
 
 **Reference**: [docs/RUNTIME_FIXES.md](RUNTIME_FIXES.md) Issue #5
 
@@ -526,34 +518,28 @@ self.dt = 1.0 / robot_config.inner_control_frequency  # Should be 1/120 = 0.0083
 
 **Problem**: Robot motion is stuttering or jerky.
 
-**Root cause**: Motor commands running at 10Hz instead of 120Hz.
+**Root cause**: Inner loop not hitting ~120Hz, or encoder polling creeping into the inner loop.
 
-**Fix**: Ensure dual-frequency architecture is working - inner loop must run at 120Hz.
+**Fix**: Keep encoder polling in the outer loop (`env.poll_encoders()`), and run `env.step()` at inner-loop rate.
 
 **Reference**: [docs/RUNTIME_FIXES.md](RUNTIME_FIXES.md) Issue #6
 
-### 4. Keyboard Interrupt Doesn't Clean Up
+### 4. Double Cleanup / Tkinter Crash on Exit
 
-**Problem**: Ctrl+C during execution leaves robot in bad state.
+**Problem**: `Tcl_AsyncDelete` or Tkinter errors on shutdown.
 
-**Solution**: Ensure proper try/finally blocks:
-```python
-try:
-    collector.run()
-finally:
-    print("\n[Main] Ensuring cleanup...")
-    collector.cleanup()
-```
+**Root cause**: `collect_demo_gym.py` already cleans up in `DemoCollector.run()`, then `__main__` repeats cleanup.
 
-**Reference**: [docs/RUNTIME_FIXES.md](RUNTIME_FIXES.md) Issue #2
+**Fix**: Add a cleanup guard or remove the redundant cleanup block if this shows up.
 
 ### 5. Camera Initialization Fails
 
-**Expected behavior**: System continues without camera, ArUco disabled.
+**Expected behavior**: System continues without camera; ArUco disabled.
 
 **Common causes**:
+- Missing GStreamer / pygobject packages
 - Wrong `camera_id` in `robot_config.py`
-- Camera not connected
+- Camera not connected or busy
 - Permission issues with `/dev/video*`
 
 **Debug**: Check available cameras with `ls /dev/video*`
@@ -562,15 +548,17 @@ finally:
 
 **Problem**: Gripper commands don't work, motor error state.
 
-**Solution**: `gym_env.py` automatically reboots motor 7 (gripper) on reset:
-```python
-print("Rebooting motor 7 to clear error state...")
-self.robot_hardware.robot_driver.reboot_motor(7)
-```
+**Solution**: Call `env.reset()` or `env.reset_gripper()` to reboot/open the gripper motor (motor 7).
 
-This is normal and expected behavior.
+### 7. ArUco Dictionary Mismatch
 
-### 7. Import Errors After Reorganization
+**Problem**: Markers never detected despite camera working.
+
+**Root cause**: `gym_env.py` uses `cv2.aruco.DICT_5X5_50` (hard-coded, not in config).
+
+**Fix**: Update the dictionary in `deployment/gym_env.py` if your tags differ.
+
+### 8. Import Errors After Reorganization
 
 **Problem**: `ModuleNotFoundError` for various modules.
 
@@ -585,18 +573,24 @@ This is normal and expected behavior.
 - ✅ External imports use `from deployment.X` or `from collection.Y`
 - ✅ Each package directory has `__init__.py`
 
-### 8. Encoder Lag Issues
+### 9. Encoder Lag Issues
 
 **Problem**: Encoder readings lag behind actual robot state.
 
 **Historical context**: This was a major issue that was fixed by:
 1. Moving encoder polling OUT of the 120Hz inner loop
 2. Only polling encoders at 10Hz in outer loop
-3. Using cached encoder values from `robot_hardware.latest_encoder_values`
+3. Using cached encoder values from `robot_hardware.latest_encoder_values` (read by `env.step()`)
 
 **If you see encoder lag**, verify encoder polling is NOT in the inner loop.
 
 **Reference**: [docs/archived/PHASE1_COMPLETE.md](archived/PHASE1_COMPLETE.md)
+
+### 10. README Trajectory Viewer Reference
+
+**Problem**: `README.md` mentions `trajectory_viewer_gui.py`, but that file is not in `compact_gym/`.
+
+**Fix**: Copy it in if needed (or update the README to avoid confusion).
 
 ---
 
@@ -622,10 +616,21 @@ python collection/validate_demo.py
 python scripts/verify_teleop_gym.py
 ```
 
+**Test 4: Random policy smoke test**
+```bash
+python scripts/test_env.py
+```
+
+**Test 5: Encoder polling performance (hardware)**
+```bash
+python scripts/test_encoder_polling.py
+```
+
 ### Syntax Checks (No Hardware Required)
 
 ```bash
 python scripts/verify_encoder_syntax.py
+python scripts/verify_encoder_implementation.py
 python scripts/verify_aruco_thread_syntax.py
 ```
 
@@ -654,6 +659,7 @@ See [docs/TESTING.md](TESTING.md) for comprehensive testing procedures.
 - [ ] NPZ file created in `data/gym_demos/`
 - [ ] Validation passes for recorded demo
 - [ ] `smoothed_aruco_*` keys present (in-place)
+- [ ] Optional: verify `_smoothed.npz` files with `scripts/verify_smoothed_trajectory.py`
 
 **Shutdown checks**:
 - [ ] Close GUI window exits cleanly
@@ -666,24 +672,17 @@ See [docs/TESTING.md](TESTING.md) for comprehensive testing procedures.
 
 ## Performance Benchmarks
 
-**Expected timings** (from profiling):
-- Control loop: ~8ms avg @ 120Hz
-- `env.step()`: 1-3ms (motor commands + IK)
-- Encoder polling: 8-12ms @ 10Hz (outer loop only)
-- ArUco detection: 30Hz (background thread)
-- Recording: < 1ms (outer loop only)
-
-**Frequencies**:
-- Inner loop (motor commands): 120Hz
-- Outer loop (input/recording): 10Hz
-- ArUco thread: 30Hz
-- Recorded data: 10Hz
+**Targets (from config)**:
+- Inner loop (motor commands): `inner_control_frequency` (default 120Hz)
+- Outer loop (input/recording): `control_frequency` (default 10Hz)
+- ArUco thread: `camera_fps` (default 30Hz)
+- Recorded data: `control_frequency` (default 10Hz)
 
 **If performance degrades**, check:
 1. USB latency still at 1ms
-2. Encoder polling not in inner loop
-3. ArUco thread not blocking main loop
-4. No unnecessary file I/O in control loop
+2. Encoder polling remains in the outer loop only
+3. ArUco thread not blocking the main loop
+4. No unnecessary file I/O in the inner loop
 
 ---
 
@@ -706,7 +705,7 @@ See [docs/TESTING.md](TESTING.md) for comprehensive testing procedures.
 
 **Solution**:
 - Background thread for ArUco detection at 30Hz
-- Non-blocking updates to `env._latest_aruco_observations`
+- Non-blocking updates to `env.latest_aruco_obs`
 - Thread-safe observation retrieval
 
 **Reference**: [docs/archived/PHASE2_COMPLETE.md](archived/PHASE2_COMPLETE.md)
@@ -754,7 +753,7 @@ env = WX200GymEnv(
     max_episode_length=1000,
     show_video=False,           # No GUI needed
     enable_aruco=True,           # Or False if no markers
-    control_frequency=robot_config.control_frequency
+    control_frequency=robot_config.control_frequency  # Match your env.step() rate
 )
 
 # Training loop
@@ -778,20 +777,21 @@ env.close()
 
 ### Observation Space
 
-The environment returns observations as a flat array:
+The environment returns a flat `np.ndarray` with 20 floats:
 
 ```python
-obs_space = {
-    'qpos': 6,              # Joint positions
-    'qvel': 6,              # Joint velocities
-    'gripper_pos': 1,       # Gripper position
-    'ee_pose': 7,           # End-effector pose [x,y,z, qx,qy,qz,qw]
-    'aruco_poses': N * 7,   # N marker poses (if enabled)
-}
-
-# Total dimension: 20 + (N_markers * 7)
-# Default: 20 + (2 * 7) = 34
+obs = np.concatenate([
+    aruco_object_in_world,  # 7D (zeros if ArUco disabled)
+    robot_state,            # 6D joint angles
+    ee_pose_debug           # 7D [x, y, z, qw, qx, qy, qz]
+])
+# shape: (20,)
 ```
+
+`info` includes extra fields when hardware is initialized:
+`encoder_values`, `qpos`, `ee_pose_fk`, and `raw_aruco`.
+
+`WX200GymEnv.observation_space` is a `Box` with shape `(20,)`.
 
 ### Reward Function
 
@@ -943,7 +943,7 @@ SpaceMouse reading runs in a separate process (`multiprocessing.Process`) becaus
 
 ArUco detection (~30ms) would block the 120Hz control loop. Background thread:
 1. Continuously captures and processes frames at 30Hz
-2. Updates shared `_latest_aruco_observations` dictionary
+2. Updates shared `latest_aruco_obs` dictionary
 3. Main thread reads latest observations without blocking
 
 **Thread safety**: Uses proper locking (`threading.Lock`) around shared data.
@@ -972,16 +972,19 @@ ArUco detection (~30ms) would block the 120Hz control loop. Background thread:
 In `collect_demo_gym.py`, profiling is already enabled. Check output:
 
 ```
-[Profiler]
-  Inner loop avg: 8.23 ms (121.5 Hz)
-  Outer loop avg: 100.1 ms (10.0 Hz)
-  ArUco thread: 33.2 ms (30.1 Hz)
+[CONTROL LOOP] Avg=8.3ms, Max=11.2ms, Iterations=500
+  [BREAKDOWN AVG] Input=0.2ms, GUI=0.1ms, Command=0.3ms, Step=2.1ms, Record=0.4ms, Viz=3.2ms, VizFPS=29.8
+  [INNER LOOP] Running at 120Hz (motor commands)
+    [ENV.STEP] Avg~3.0s Denorm=0.1ms, Exec=1.8ms, Encoder=0.0ms, Obs=0.4ms, Info=0.1ms
+[ARUCO STATS] Freq=29.9Hz, Total=33.1ms (Detect=8.4ms, Max=45.0ms)
 ```
 
 If numbers look wrong, investigate:
 - Inner loop > 10ms → Something blocking in step()
 - Outer loop > 120ms → Encoder polling or ArUco check too slow
 - ArUco thread > 50ms → Camera resolution too high or detection too slow
+
+Tip: Set `robot_config.verbose_profiling = True` for more frequent `[ENV.STEP]` summaries.
 
 ### Check USB Latency
 
@@ -999,7 +1002,8 @@ Add debug prints in `gym_env.py`:
 ```python
 def step(self, action):
     print(f"Action: {action}")
-    print(f"EE pose: {self.robot_hardware.controller.get_ee_position()}")
+    print(f"Target pos: {self.robot_hardware.robot_controller.get_target_position()}")
+    print(f"Target quat: {self.robot_hardware.robot_controller.get_target_orientation_quat_wxyz()}")
     # ...
 ```
 
@@ -1021,6 +1025,12 @@ python collection/validate_demo.py --all
 **"ModuleNotFoundError: No module named 'gymnasium'"**
 - Missing dependencies, run: `pip install gymnasium mujoco numpy opencv-python`
 
+**"ModuleNotFoundError: No module named 'loop_rate_limiters'"**
+- Required by `collect_demo_gym.py`, install: `pip install loop-rate-limiters`
+
+**"ModuleNotFoundError: No module named 'mink'"**
+- Required by IK solver, install the `mink` package (see `robot_kinematics.py` imports)
+
 **"ModuleNotFoundError: No module named 'robot_kinematics'"**
 - Import error, should be `from .robot_kinematics import ...` in `deployment/` files
 
@@ -1030,6 +1040,9 @@ python collection/validate_demo.py --all
 **"Camera initialization failed"**
 - Expected if no camera, system continues without ArUco
 - If camera exists, check `camera_id` in `robot_config.py`
+
+**"GStreamer not available"**
+- `deployment/camera.py` requires GStreamer + pygobject; install or disable camera/ArUco
 
 **"Motor 7 error state"**
 - Gripper motor, auto-reboots on reset, this is normal
@@ -1099,32 +1112,15 @@ python collection/validate_demo.py --all
 
 **Constants**:
 - `UPPER_SNAKE_CASE` for constants
-- `MAX_VELOCITY`, `MARKER_SIZE`, `ARUCO_DICT_4X4_50`
+- `MARKER_SIZE`, `AXIS_LENGTH`
 
 ---
 
 ## Git Workflow
 
-### Current Branch
-```
-main
-```
-
-### Recent Commits
-```
-e612148 untracked .npz
-ee76d08 started gym migration, compact_code has most updated demo collection
-150e045 added fix for USB latency, threading, and other data collection infrastructure changes
-490a112 added old_data to gitignore
-4dab539 fixed encoder lag during collection, added ee ik vs fk comparisons
-```
-
-### Uncommitted Changes
-
-Currently modified:
-- `compact_gym/collect_demo_gym.py`
-
-**Note**: The directory reorganization (2026-01-16) has NOT been committed yet. User was testing when this handoff was created.
+### Branch / Status
+Always check `git status` before making assumptions about local changes.  
+Use `git branch` if you need to confirm the current branch.
 
 ### Commit Message Style
 
@@ -1224,20 +1220,19 @@ Before making changes, verify you understand:
 
 - [ ] Directory structure: `deployment/`, `collection/`, `scripts/`
 - [ ] Import rules: Relative imports within packages, absolute between packages
-- [ ] Action space: Normalized `[-1, 1]^7`, world frame velocities
+- [ ] Action space: Normalized `[-1, 1]^7`, world frame velocities + gripper position
 - [ ] Dual-frequency architecture: 120Hz inner, 10Hz outer
 - [ ] Layer separation: Teleop → Env → Hardware (no pollution)
 - [ ] User preferences: Don't over-engineer, prefer existing files, concise code
 - [ ] Testing procedures: Always test before claiming success
-- [ ] Git status: `collect_demo_gym.py` currently modified, reorganization not committed yet
+- [ ] Git status: check `git status` before assuming local modifications
 
-**When in doubt**: Ask the user instead of making assumptions!
+**When in doubt**: Re-read the code, document assumptions, and ask only if blocked.
 
 ---
 
-**This handoff document was created**: 2026-01-16
-**Last tested**: 2026-01-16 (reorganization testing in progress)
-**Status**: ✅ Production ready, reorganization complete
-**Next milestone**: Commit reorganization after user validates testing
+**This handoff document was created**: 2026-01-16  
+**Last tested**: 2026-01-16 (see docs/TESTING.md for current checklist)  
+**Status**: ✅ Production Ready (reorg complete; validate after edits)
 
 Good luck! 🚀

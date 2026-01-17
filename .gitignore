@@ -2,3 +2,5 @@
 data/
 **/old_data/
 *.npz
+
+.vscode/
